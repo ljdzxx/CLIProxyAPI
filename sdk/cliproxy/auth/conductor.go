@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"path/filepath"
@@ -75,6 +76,9 @@ const (
 
 var quotaCooldownDisabled atomic.Bool
 
+// ErrRefreshAlreadyInProgress indicates another refresh operation is active for the same auth.
+var ErrRefreshAlreadyInProgress = errors.New("auth refresh already in progress")
+
 // SetQuotaCooldownDisabled toggles quota cooldown scheduling globally.
 func SetQuotaCooldownDisabled(disable bool) {
 	quotaCooldownDisabled.Store(disable)
@@ -141,13 +145,15 @@ func (NoopHook) OnResult(context.Context, Result) {}
 
 // Manager orchestrates auth lifecycle, selection, execution, and persistence.
 type Manager struct {
-	store     Store
-	executors map[string]ProviderExecutor
-	selector  Selector
-	hook      Hook
-	mu        sync.RWMutex
-	auths     map[string]*Auth
-	scheduler *authScheduler
+	store      Store
+	executors  map[string]ProviderExecutor
+	selector   Selector
+	hook       Hook
+	mu         sync.RWMutex
+	auths      map[string]*Auth
+	scheduler  *authScheduler
+	refreshMu  sync.Mutex
+	refreshing map[string]struct{}
 	// providerOffsets tracks per-model provider rotation state for multi-provider routing.
 	providerOffsets map[string]int
 
@@ -192,6 +198,7 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		selector:         selector,
 		hook:             hook,
 		auths:            make(map[string]*Auth),
+		refreshing:       make(map[string]struct{}),
 		providerOffsets:  make(map[string]int),
 		modelPoolOffsets: make(map[string]int),
 	}
@@ -3226,6 +3233,88 @@ func (m *Manager) queueRefreshReschedule(authID string) {
 	loop.queueReschedule(authID)
 }
 
+func (m *Manager) beginRefresh(id string) bool {
+	if m == nil || strings.TrimSpace(id) == "" {
+		return false
+	}
+	m.refreshMu.Lock()
+	defer m.refreshMu.Unlock()
+	if m.refreshing == nil {
+		m.refreshing = make(map[string]struct{})
+	}
+	if _, ok := m.refreshing[id]; ok {
+		return false
+	}
+	m.refreshing[id] = struct{}{}
+	return true
+}
+
+func (m *Manager) endRefresh(id string) {
+	if m == nil || strings.TrimSpace(id) == "" {
+		return
+	}
+	m.refreshMu.Lock()
+	delete(m.refreshing, id)
+	m.refreshMu.Unlock()
+}
+
+// RefreshAuthNow synchronously refreshes one auth through its provider executor
+// and persists the updated credentials on success.
+func (m *Manager) RefreshAuthNow(ctx context.Context, id string) (*Auth, error) {
+	id = strings.TrimSpace(id)
+	if m == nil {
+		return nil, errors.New("auth manager is nil")
+	}
+	if id == "" {
+		return nil, errors.New("auth id is required")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if !m.beginRefresh(id) {
+		return nil, ErrRefreshAlreadyInProgress
+	}
+	defer m.endRefresh(id)
+
+	m.mu.RLock()
+	auth := m.auths[id]
+	var exec ProviderExecutor
+	var cloned *Auth
+	if auth != nil {
+		exec = m.executors[auth.Provider]
+		cloned = auth.Clone()
+	}
+	m.mu.RUnlock()
+	if auth == nil {
+		return nil, errors.New("auth not found")
+	}
+	if exec == nil {
+		return nil, fmt.Errorf("executor not registered for provider %s", auth.Provider)
+	}
+
+	updated, err := exec.Refresh(ctx, cloned)
+	if err != nil {
+		return nil, err
+	}
+	if updated == nil {
+		updated = cloned
+	}
+	// Preserve runtime created by the executor during Refresh.
+	// If executor didn't set one, fall back to the previous runtime.
+	if updated.Runtime == nil {
+		updated.Runtime = auth.Runtime
+	}
+	now := time.Now()
+	updated.LastRefreshedAt = now
+	updated.NextRefreshAfter = time.Time{}
+	updated.LastError = nil
+	updated.UpdatedAt = now
+	if m.shouldRefresh(updated, now) {
+		updated.NextRefreshAfter = now.Add(refreshIneffectiveBackoff)
+	}
+	return m.Update(ctx, updated)
+}
+
 func (m *Manager) shouldRefresh(a *Auth, now time.Time) bool {
 	if a == nil || a.Disabled {
 		return false
@@ -3454,6 +3543,11 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if !m.beginRefresh(id) {
+		return
+	}
+	defer m.endRefresh(id)
+
 	m.mu.RLock()
 	auth := m.auths[id]
 	var exec ProviderExecutor

@@ -1118,6 +1118,113 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "disabled": *req.Disabled})
 }
 
+// RefreshAuthFileToken refreshes one Codex auth file through the core auth manager
+// and persists the updated credentials.
+func (h *Handler) RefreshAuthFileToken(c *gin.Context) {
+	if h == nil || h.authManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
+		return
+	}
+
+	var req struct {
+		Name      string `json:"name"`
+		AuthIndex string `json:"auth_index"`
+		ID        string `json:"id"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+
+	target := h.findAuthForRefresh(req.AuthIndex, req.ID, req.Name)
+	if target == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
+		return
+	}
+	if !strings.EqualFold(strings.TrimSpace(target.Provider), "codex") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "only codex auth files support manual refresh"})
+		return
+	}
+
+	oldRefreshToken := stringValue(target.Metadata, "refresh_token")
+	if oldRefreshToken == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "refresh_token is missing"})
+		return
+	}
+	oldAccessToken := stringValue(target.Metadata, "access_token")
+
+	updated, err := h.authManager.RefreshAuthNow(c.Request.Context(), target.ID)
+	if err != nil {
+		if errors.Is(err, coreauth.ErrRefreshAlreadyInProgress) {
+			c.JSON(http.StatusConflict, gin.H{"error": "auth refresh already in progress"})
+			return
+		}
+		c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("auth token refresh failed: %v", err)})
+		return
+	}
+	if updated == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "auth token refresh returned empty result"})
+		return
+	}
+	updated.EnsureIndex()
+
+	newRefreshToken := stringValue(updated.Metadata, "refresh_token")
+	newAccessToken := stringValue(updated.Metadata, "access_token")
+	lastRefresh := stringValue(updated.Metadata, "last_refresh")
+	if lastRefresh == "" && !updated.LastRefreshedAt.IsZero() {
+		lastRefresh = updated.LastRefreshedAt.Format(time.RFC3339)
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":                "ok",
+		"id":                    updated.ID,
+		"name":                  updated.FileName,
+		"auth_index":            updated.Index,
+		"provider":              updated.Provider,
+		"last_refresh":          lastRefresh,
+		"expired":               stringValue(updated.Metadata, "expired"),
+		"refresh_token_rotated": oldRefreshToken != "" && newRefreshToken != "" && oldRefreshToken != newRefreshToken,
+		"access_token_updated":  oldAccessToken != "" && newAccessToken != "" && oldAccessToken != newAccessToken,
+	})
+}
+
+func (h *Handler) findAuthForRefresh(authIndex, id, name string) *coreauth.Auth {
+	if h == nil || h.authManager == nil {
+		return nil
+	}
+	if auth := h.authByIndex(authIndex); auth != nil {
+		return auth
+	}
+	keys := []string{strings.TrimSpace(id), strings.TrimSpace(name)}
+	for _, key := range keys {
+		if key == "" {
+			continue
+		}
+		if auth, ok := h.authManager.GetByID(key); ok {
+			return auth
+		}
+	}
+	auths := h.authManager.List()
+	for _, auth := range auths {
+		if auth == nil {
+			continue
+		}
+		auth.EnsureIndex()
+		for _, key := range keys {
+			if key == "" {
+				continue
+			}
+			if auth.Index == key || auth.ID == key || auth.FileName == key {
+				return auth
+			}
+			if filepath.Base(strings.TrimSpace(authAttribute(auth, "path"))) == key {
+				return auth
+			}
+		}
+	}
+	return nil
+}
+
 // PatchAuthFileFields updates editable fields (prefix, proxy_url, headers, priority, note) of an auth file.
 func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	if h.authManager == nil {

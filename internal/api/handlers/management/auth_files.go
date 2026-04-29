@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/antigravity"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/claude"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
@@ -61,6 +62,23 @@ var (
 	errAuthFileMustBeJSON = errors.New("auth file must be .json")
 	errAuthFileNotFound   = errors.New("auth file not found")
 )
+
+type authRefreshJobFailure struct {
+	Name  string `json:"name"`
+	Error string `json:"error"`
+}
+
+type authRefreshJob struct {
+	ID         string                  `json:"id"`
+	Status     string                  `json:"status"`
+	StartedAt  time.Time               `json:"started_at"`
+	FinishedAt time.Time               `json:"finished_at,omitempty"`
+	Total      int                     `json:"total"`
+	Refreshed  int                     `json:"refreshed"`
+	Skipped    int                     `json:"skipped"`
+	Failed     int                     `json:"failed"`
+	Failures   []authRefreshJobFailure `json:"failures,omitempty"`
+}
 
 func extractLastRefreshTimestamp(meta map[string]any) (time.Time, bool) {
 	if len(meta) == 0 {
@@ -374,19 +392,20 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 		name = auth.ID
 	}
 	entry := gin.H{
-		"id":             auth.ID,
-		"auth_index":     auth.Index,
-		"name":           name,
-		"type":           strings.TrimSpace(auth.Provider),
-		"provider":       strings.TrimSpace(auth.Provider),
-		"label":          auth.Label,
-		"status":         auth.Status,
-		"status_message": auth.StatusMessage,
-		"disabled":       auth.Disabled,
-		"unavailable":    auth.Unavailable,
-		"runtime_only":   runtimeOnly,
-		"source":         "memory",
-		"size":           int64(0),
+		"id":                   auth.ID,
+		"auth_index":           auth.Index,
+		"name":                 name,
+		"type":                 strings.TrimSpace(auth.Provider),
+		"provider":             strings.TrimSpace(auth.Provider),
+		"label":                auth.Label,
+		"status":               auth.Status,
+		"status_message":       auth.StatusMessage,
+		"disabled":             auth.Disabled,
+		"unavailable":          auth.Unavailable,
+		"refresh_token_locked": authRefreshTokenLocked(auth),
+		"runtime_only":         runtimeOnly,
+		"source":               "memory",
+		"size":                 int64(0),
 	}
 	if email := authEmail(auth); email != "" {
 		entry["email"] = email
@@ -1118,6 +1137,84 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "disabled": *req.Disabled})
 }
 
+func authRefreshTokenLocked(auth *coreauth.Auth) bool {
+	if auth == nil || len(auth.Metadata) == 0 {
+		return false
+	}
+	switch v := auth.Metadata["refresh_token_locked"].(type) {
+	case bool:
+		return v
+	case string:
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "1", "true", "yes", "on":
+			return true
+		default:
+			return false
+		}
+	default:
+		return false
+	}
+}
+
+// PatchAuthFileRefreshTokenLock toggles whether manual refresh-token actions
+// may operate on a specific auth file.
+func (h *Handler) PatchAuthFileRefreshTokenLock(c *gin.Context) {
+	if h == nil || h.authManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
+		return
+	}
+
+	var req struct {
+		Name      string `json:"name"`
+		AuthIndex string `json:"auth_index"`
+		ID        string `json:"id"`
+		Locked    *bool  `json:"locked"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+	if req.Locked == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "locked is required"})
+		return
+	}
+
+	target := h.findAuthForRefresh(req.AuthIndex, req.ID, req.Name)
+	if target == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
+		return
+	}
+	if !strings.EqualFold(strings.TrimSpace(target.Provider), "codex") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "only codex auth files support refresh token lock"})
+		return
+	}
+
+	if target.Metadata == nil {
+		target.Metadata = make(map[string]any)
+	}
+	target.Metadata["refresh_token_locked"] = *req.Locked
+	target.UpdatedAt = time.Now()
+
+	updated, err := h.authManager.Update(c.Request.Context(), target)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update auth: %v", err)})
+		return
+	}
+	if updated == nil {
+		updated = target
+	}
+	updated.EnsureIndex()
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":     "ok",
+		"id":         updated.ID,
+		"name":       updated.FileName,
+		"auth_index": updated.Index,
+		"provider":   updated.Provider,
+		"locked":     authRefreshTokenLocked(updated),
+	})
+}
+
 // RefreshAuthFileToken refreshes one Codex auth file through the core auth manager
 // and persists the updated credentials.
 func (h *Handler) RefreshAuthFileToken(c *gin.Context) {
@@ -1143,6 +1240,10 @@ func (h *Handler) RefreshAuthFileToken(c *gin.Context) {
 	}
 	if !strings.EqualFold(strings.TrimSpace(target.Provider), "codex") {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "only codex auth files support manual refresh"})
+		return
+	}
+	if authRefreshTokenLocked(target) {
+		c.JSON(http.StatusLocked, gin.H{"error": "auth refresh token is locked"})
 		return
 	}
 
@@ -1186,6 +1287,228 @@ func (h *Handler) RefreshAuthFileToken(c *gin.Context) {
 		"refresh_token_rotated": oldRefreshToken != "" && newRefreshToken != "" && oldRefreshToken != newRefreshToken,
 		"access_token_updated":  oldAccessToken != "" && newAccessToken != "" && oldAccessToken != newAccessToken,
 	})
+}
+
+// StartRefreshAllAuthFileTokens starts an asynchronous refresh-token job for
+// all Codex auth files that have a refresh token and are not locked.
+func (h *Handler) StartRefreshAllAuthFileTokens(c *gin.Context) {
+	if h == nil || h.authManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
+		return
+	}
+
+	job := &authRefreshJob{
+		ID:        uuid.NewString(),
+		Status:    "running",
+		StartedAt: time.Now(),
+	}
+
+	if !h.beginRefreshAllJob(job) {
+		c.JSON(http.StatusConflict, gin.H{"error": "auth refresh job already in progress"})
+		return
+	}
+
+	auths := h.authManager.List()
+	go h.runRefreshAllAuthFileTokens(context.Background(), job.ID, auths)
+
+	c.JSON(http.StatusAccepted, gin.H{
+		"status": "accepted",
+		"job_id": job.ID,
+		"job":    h.authRefreshJobSnapshot(job.ID),
+	})
+}
+
+// GetRefreshAuthFileTokenJob returns progress for a bulk refresh-token job.
+func (h *Handler) GetRefreshAuthFileTokenJob(c *gin.Context) {
+	if h == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "handler unavailable"})
+		return
+	}
+	id := strings.TrimSpace(c.Param("id"))
+	if id == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "job id is required"})
+		return
+	}
+	job := h.authRefreshJobSnapshot(id)
+	if job == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "auth refresh job not found"})
+		return
+	}
+	c.JSON(http.StatusOK, job)
+}
+
+func (h *Handler) beginRefreshAllJob(job *authRefreshJob) bool {
+	if h == nil || job == nil || strings.TrimSpace(job.ID) == "" {
+		return false
+	}
+	h.refreshJobsMu.Lock()
+	defer h.refreshJobsMu.Unlock()
+	if h.refreshJobRunning {
+		return false
+	}
+	if h.refreshJobs == nil {
+		h.refreshJobs = make(map[string]*authRefreshJob)
+	}
+	h.pruneRefreshJobsLocked(time.Now())
+	h.refreshJobs[job.ID] = job
+	h.refreshJobRunning = true
+	return true
+}
+
+func (h *Handler) finishRefreshAllJob(id, status string) {
+	if h == nil || strings.TrimSpace(id) == "" {
+		return
+	}
+	if strings.TrimSpace(status) == "" {
+		status = "completed"
+	}
+	h.refreshJobsMu.Lock()
+	defer h.refreshJobsMu.Unlock()
+	if job := h.refreshJobs[id]; job != nil {
+		job.Status = status
+		job.FinishedAt = time.Now()
+	}
+	h.refreshJobRunning = false
+}
+
+func (h *Handler) updateRefreshAllJob(id string, fn func(*authRefreshJob)) {
+	if h == nil || strings.TrimSpace(id) == "" || fn == nil {
+		return
+	}
+	h.refreshJobsMu.Lock()
+	defer h.refreshJobsMu.Unlock()
+	if job := h.refreshJobs[id]; job != nil {
+		fn(job)
+	}
+}
+
+func (h *Handler) authRefreshJobSnapshot(id string) *authRefreshJob {
+	if h == nil || strings.TrimSpace(id) == "" {
+		return nil
+	}
+	h.refreshJobsMu.Lock()
+	defer h.refreshJobsMu.Unlock()
+	job := h.refreshJobs[id]
+	if job == nil {
+		return nil
+	}
+	copyJob := *job
+	if len(job.Failures) > 0 {
+		copyJob.Failures = append([]authRefreshJobFailure(nil), job.Failures...)
+	}
+	return &copyJob
+}
+
+func (h *Handler) pruneRefreshJobsLocked(now time.Time) {
+	if h == nil || len(h.refreshJobs) == 0 {
+		return
+	}
+	const maxAge = 6 * time.Hour
+	for id, job := range h.refreshJobs {
+		if job == nil {
+			delete(h.refreshJobs, id)
+			continue
+		}
+		if !job.FinishedAt.IsZero() && now.Sub(job.FinishedAt) > maxAge {
+			delete(h.refreshJobs, id)
+		}
+	}
+}
+
+func (h *Handler) runRefreshAllAuthFileTokens(ctx context.Context, jobID string, auths []*coreauth.Auth) {
+	status := "completed"
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			status = "failed"
+			h.updateRefreshAllJob(jobID, func(job *authRefreshJob) {
+				job.Failures = append(job.Failures, authRefreshJobFailure{
+					Name:  "bulk-refresh",
+					Error: fmt.Sprintf("panic: %v", recovered),
+				})
+				job.Failed++
+			})
+		}
+		h.finishRefreshAllJob(jobID, status)
+	}()
+
+	targets := make([]*coreauth.Auth, 0, len(auths))
+	for _, auth := range auths {
+		if auth == nil {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+			continue
+		}
+		if stringValue(auth.Metadata, "refresh_token") == "" {
+			continue
+		}
+		targets = append(targets, auth.Clone())
+	}
+
+	h.updateRefreshAllJob(jobID, func(job *authRefreshJob) {
+		job.Total = len(targets)
+	})
+
+	for _, target := range targets {
+		name := strings.TrimSpace(target.FileName)
+		if name == "" {
+			name = target.ID
+		}
+		if authRefreshTokenLocked(target) {
+			h.updateRefreshAllJob(jobID, func(job *authRefreshJob) {
+				job.Skipped++
+			})
+			continue
+		}
+		if current, ok := h.authManager.GetByID(target.ID); ok && authRefreshTokenLocked(current) {
+			h.updateRefreshAllJob(jobID, func(job *authRefreshJob) {
+				job.Skipped++
+			})
+			continue
+		}
+
+		updated, err := h.authManager.RefreshAuthNow(ctx, target.ID)
+		if err != nil {
+			if errors.Is(err, coreauth.ErrRefreshAlreadyInProgress) {
+				h.updateRefreshAllJob(jobID, func(job *authRefreshJob) {
+					job.Skipped++
+					job.Failures = append(job.Failures, authRefreshJobFailure{
+						Name:  name,
+						Error: "auth refresh already in progress",
+					})
+				})
+				continue
+			}
+			h.updateRefreshAllJob(jobID, func(job *authRefreshJob) {
+				job.Failed++
+				job.Failures = append(job.Failures, authRefreshJobFailure{
+					Name:  name,
+					Error: err.Error(),
+				})
+			})
+			continue
+		}
+		if updated == nil {
+			h.updateRefreshAllJob(jobID, func(job *authRefreshJob) {
+				job.Failed++
+				job.Failures = append(job.Failures, authRefreshJobFailure{
+					Name:  name,
+					Error: "auth token refresh returned empty result",
+				})
+			})
+			continue
+		}
+		h.updateRefreshAllJob(jobID, func(job *authRefreshJob) {
+			job.Refreshed++
+		})
+	}
+	if snapshot := h.authRefreshJobSnapshot(jobID); snapshot != nil && snapshot.Failed > 0 {
+		if snapshot.Refreshed == 0 {
+			status = "failed"
+		} else {
+			status = "partial"
+		}
+	}
 }
 
 func (h *Handler) findAuthForRefresh(authIndex, id, name string) *coreauth.Auth {

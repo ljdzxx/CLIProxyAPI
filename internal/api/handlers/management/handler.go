@@ -48,6 +48,9 @@ type Handler struct {
 	envSecret           string
 	logDir              string
 	postAuthHook        coreauth.PostAuthHook
+	refreshJobsMu       sync.Mutex
+	refreshJobs         map[string]*authRefreshJob
+	refreshJobRunning   bool
 }
 
 // NewHandler creates a new management handler instance.
@@ -64,6 +67,7 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 		tokenStore:          sdkAuth.GetTokenStore(),
 		allowRemoteOverride: envSecret != "",
 		envSecret:           envSecret,
+		refreshJobs:         make(map[string]*authRefreshJob),
 	}
 	h.startAttemptCleanup()
 	return h

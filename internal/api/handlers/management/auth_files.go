@@ -1260,6 +1260,10 @@ func (h *Handler) RefreshAuthFileToken(c *gin.Context) {
 			c.JSON(http.StatusConflict, gin.H{"error": "auth refresh already in progress"})
 			return
 		}
+		if errors.Is(err, coreauth.ErrRefreshTokenLocked) {
+			c.JSON(http.StatusLocked, gin.H{"error": "auth refresh token is locked"})
+			return
+		}
 		c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("auth token refresh failed: %v", err)})
 		return
 	}
@@ -1469,12 +1473,16 @@ func (h *Handler) runRefreshAllAuthFileTokens(ctx context.Context, jobID string,
 
 		updated, err := h.authManager.RefreshAuthNow(ctx, target.ID)
 		if err != nil {
-			if errors.Is(err, coreauth.ErrRefreshAlreadyInProgress) {
+			if errors.Is(err, coreauth.ErrRefreshAlreadyInProgress) || errors.Is(err, coreauth.ErrRefreshTokenLocked) {
+				message := "auth refresh already in progress"
+				if errors.Is(err, coreauth.ErrRefreshTokenLocked) {
+					message = "auth refresh token is locked"
+				}
 				h.updateRefreshAllJob(jobID, func(job *authRefreshJob) {
 					job.Skipped++
 					job.Failures = append(job.Failures, authRefreshJobFailure{
 						Name:  name,
-						Error: "auth refresh already in progress",
+						Error: message,
 					})
 				})
 				continue

@@ -79,6 +79,10 @@ var quotaCooldownDisabled atomic.Bool
 // ErrRefreshAlreadyInProgress indicates another refresh operation is active for the same auth.
 var ErrRefreshAlreadyInProgress = errors.New("auth refresh already in progress")
 
+// ErrRefreshTokenLocked indicates the auth record is locked against manual
+// refresh-token operations.
+var ErrRefreshTokenLocked = errors.New("auth refresh token is locked")
+
 // SetQuotaCooldownDisabled toggles quota cooldown scheduling globally.
 func SetQuotaCooldownDisabled(disable bool) {
 	quotaCooldownDisabled.Store(disable)
@@ -3291,6 +3295,9 @@ func (m *Manager) RefreshAuthNow(ctx context.Context, id string) (*Auth, error) 
 	if exec == nil {
 		return nil, fmt.Errorf("executor not registered for provider %s", auth.Provider)
 	}
+	if authRefreshTokenLocked(cloned) {
+		return nil, ErrRefreshTokenLocked
+	}
 
 	updated, err := exec.Refresh(ctx, cloned)
 	if err != nil {
@@ -3313,6 +3320,25 @@ func (m *Manager) RefreshAuthNow(ctx context.Context, id string) (*Auth, error) 
 		updated.NextRefreshAfter = now.Add(refreshIneffectiveBackoff)
 	}
 	return m.Update(ctx, updated)
+}
+
+func authRefreshTokenLocked(auth *Auth) bool {
+	if auth == nil || len(auth.Metadata) == 0 {
+		return false
+	}
+	switch v := auth.Metadata["refresh_token_locked"].(type) {
+	case bool:
+		return v
+	case string:
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "1", "true", "yes", "on":
+			return true
+		default:
+			return false
+		}
+	default:
+		return false
+	}
 }
 
 func (m *Manager) shouldRefresh(a *Auth, now time.Time) bool {

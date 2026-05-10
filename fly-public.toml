@@ -1,0 +1,47 @@
+app = "lj-cpa-ams"
+primary_region = "ams"
+[build]
+  image = "eceasy/cli-proxy-api:latest"
+
+[env]
+  DEPLOY = "cloud"
+  HOME = "/data"
+  TZ = "Asia/Shanghai"
+  WRITABLE_PATH = "/data"
+
+[processes]
+  app = "/CLIProxyAPI/CLIProxyAPI --config /CLIProxyAPI/config.yaml"
+
+[[files]]
+  guest_path = "/CLIProxyAPI/config.yaml"
+  secret_name = "CONFIG_YAML"
+  processes = ["app"]
+
+[http_service]
+  internal_port = 8317
+  force_https = true
+  auto_start_machines = true
+  auto_stop_machines = "off"
+  min_machines_running = 1
+  processes = ["app"]
+
+  [http_service.concurrency]
+    type = "connections"
+    soft_limit = 100
+    hard_limit = 200
+
+  [[http_service.checks]]
+    grace_period = "60s"
+    interval = "45s"
+    method = "GET"
+    path = "/healthz"
+    timeout = "5s"
+
+[[mounts]]
+  source = "cliproxyapi_data"
+  destination = "/data"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 1024

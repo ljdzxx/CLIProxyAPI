@@ -1,0 +1,394 @@
+# 服务监听的主机/网卡地址。默认空字符串（""）表示绑定所有网卡（IPv4 + IPv6）。
+# 使用 "127.0.0.1" 或 "localhost" 可将访问限制在本机。
+host: ""
+
+# 服务端口
+port: 8317
+
+# HTTPS 的 TLS 设置。启用后，服务将使用提供的证书和私钥监听。
+tls:
+  enable: false
+  cert: ""
+  key: ""
+
+# 管理 API 设置
+remote-management:
+  # 是否允许远程（非 localhost）访问管理接口。
+  # 为 false 时，只有 localhost 可以访问管理接口（仍然需要管理密钥）。
+  allow-remote: false
+
+  # 管理密钥。如果这里填写的是明文，启动时会自动哈希。
+  # 所有管理请求（包括来自 localhost 的请求）都必须携带此密钥。
+  # 留空则完全禁用 Management API（所有 /v0/management 路由都会返回 404）。
+  secret-key: ""
+
+  # 为 true 时，禁用内置管理面板资源下载和对应的 HTTP 路由。
+  disable-control-panel: false
+
+  # 禁用从 GitHub 自动周期性更新管理面板（默认：false）。
+  # 启用后，仅在首次访问且本地缺失时下载一次，之后不再自动更新。
+  # disable-auto-update-panel: false
+
+  # 管理面板对应的 GitHub 仓库。支持填写仓库 URL 或 releases API URL。
+  panel-github-repository: "https://github.com/router-for-me/Cli-Proxy-API-Management-Center"
+
+# 认证目录（支持使用 ~ 表示 home 目录）
+auth-dir: "~/.cli-proxy-api"
+
+# 用于下游客户端认证的 API keys
+api-keys:
+  - "your-api-key-1"
+  - "your-api-key-2"
+  - "your-api-key-3"
+
+# 是否开启 debug 日志
+debug: false
+
+# 是否启用 pprof HTTP 调试服务（host:port）。出于安全考虑，建议仅绑定 localhost。
+pprof:
+  enable: false
+  addr: "127.0.0.1:8316"
+
+# 为 true 时，禁用高开销 HTTP 中间件特性，以降低高并发下的单请求内存占用。
+commercial-mode: false
+
+# 为 true 时，将应用日志写入滚动日志文件，而不是 stdout
+logging-to-file: false
+
+# logs 目录下日志文件允许的总大小上限（MB）。超过后会删除最旧的日志文件，
+# 直到回到限制以内。设为 0 可禁用该限制。
+logs-max-total-size-mb: 0
+
+# 当请求日志关闭时，最多保留多少个错误日志文件。
+# 超过后会删除最旧的错误日志文件。默认 10，设为 0 可禁用清理。
+error-logs-max-files: 10
+
+# 为 false 时，禁用内存中的 usage 统计聚合
+usage-statistics-enabled: false
+
+# 代理 URL。支持 socks5/http/https。示例：socks5://user:pass@192.168.1.1:1080/
+# 单个条目的 proxy-url 也支持 "direct" 或 "none"，用于显式绕过全局 proxy-url 和环境代理。
+proxy-url: ""
+
+# 为 true 时，未带前缀的模型请求只会匹配没有 prefix 的凭据（prefix == model name 的情况除外）。
+force-model-prefix: false
+
+# 为 true 时，将过滤后的上游响应头继续转发给下游客户端。
+# 默认 false（关闭）。
+passthrough-headers: false
+
+# 请求失败后的重试次数。仅当 HTTP 状态码为 403、408、500、502、503、504 时触发重试。
+request-retry: 3
+
+# 单次失败请求最多尝试多少个不同凭据。
+# 设为 0 表示保留旧行为（尝试所有可用凭据）。
+max-retry-credentials: 0
+
+# 在触发重试前，最多等待冷却中的凭据恢复多少秒。
+max-retry-interval: 30
+
+# 为 true 时，全局禁用 auth/model 冷却调度（避免失败后进入 blackout 窗口）。
+disable-cooling: false
+
+# 核心 auth 自动刷新 worker 池大小（OAuth / 文件型 auth token 刷新）。
+# 当值 > 0 时，将覆盖默认 worker 数量（16）。
+# auth-auto-refresh-workers: 16
+
+# 配额超限时的行为
+quota-exceeded:
+  switch-project: true # 配额超限时是否自动切换到其他 project
+  switch-preview-model: true # 配额超限时是否自动切换到 preview 模型
+  antigravity-credits: true # 当 Claude 免费额度全部耗尽时，是否使用 credits 作为最后兜底
+
+# 多个匹配凭据之间的路由策略
+routing:
+  strategy: "round-robin" # round-robin（默认）、fill-first
+  # 为所有客户端启用通用的会话粘滞路由。
+  # Session ID 会从以下位置提取：X-Session-ID header、Idempotency-Key、
+  # metadata.user_id、conversation_id，或前几条消息的哈希。
+  # 当已绑定 auth 不可用时，始终会自动 failover。
+  session-affinity: false # 默认：false
+  # session 到 auth 的绑定保留时长。默认：1h
+  session-affinity-ttl: "1h"
+
+# 为 true 时，启用 WebSocket API（/v1/ws）的认证。
+ws-auth: false
+
+# 为 true 时，启用 Gemini CLI 内部端点（/v1internal:*）。
+# 出于安全考虑，默认 false。
+enable-gemini-cli-endpoint: false
+
+# 当值 > 0 时，非流式响应每 N 秒发送一个空行，防止空闲超时。
+nonstream-keepalive-interval: 0
+# 流式响应行为（SSE keep-alive + 安全启动重试）。
+# streaming:
+#   keepalive-seconds: 15   # 默认：0（关闭）。<= 0 表示禁用 keep-alive。
+#   bootstrap-retries: 1    # 默认：0（关闭）。在首字节发送前允许重试次数。
+
+# thinking 块的签名缓存校验（Antigravity/Claude）。
+# 为 true（默认）时，优先使用并校验缓存签名。
+# 为 false 时，归一化后直接使用客户端签名（适用于测试时绕过）。
+# antigravity-signature-cache-enabled: true
+
+# 签名绕过模式下的严格校验设置（仅在禁用签名缓存时生效）。
+# 为 true 时，校验完整 Claude protobuf 树结构（Field 2 -> Field 1）。
+# 为 false（默认）时，仅检查 R/E 前缀 + base64 + 首字节 0x12。
+# antigravity-signature-bypass-strict: false
+
+# Gemini API keys
+# gemini-api-key:
+#   - api-key: "AIzaSy...01"
+#     prefix: "test" # 可选：要求使用类似 "test/gemini-3-pro-preview" 的调用方式命中该凭据
+#     base-url: "https://generativelanguage.googleapis.com"
+#     headers:
+#       X-Custom-Header: "custom-value"
+#     proxy-url: "socks5://proxy.example.com:1080"
+#     # proxy-url: "direct" # 可选：为该凭据显式直连
+#     models:
+#       - name: "gemini-2.5-flash" # 上游模型名
+#         alias: "gemini-flash"    # 客户端使用的别名，会映射到上游模型
+#     excluded-models:
+#       - "gemini-2.5-pro"     # 排除指定模型（精确匹配）
+#       - "gemini-2.5-*"       # 通配前缀匹配（如 gemini-2.5-flash、gemini-2.5-pro）
+#       - "*-preview"          # 通配后缀匹配（如 gemini-3-pro-preview）
+#       - "*flash*"            # 通配子串匹配（如 gemini-2.5-flash-lite）
+#   - api-key: "AIzaSy...02"
+
+# Codex API keys
+# codex-api-key:
+#   - api-key: "sk-atSM..."
+#     prefix: "test" # 可选：要求使用类似 "test/gpt-5-codex" 的调用方式命中该凭据
+#     base-url: "https://www.example.com" # 使用自定义 Codex API 端点
+#     headers:
+#       X-Custom-Header: "custom-value"
+#     proxy-url: "socks5://proxy.example.com:1080" # 可选：按 key 覆盖代理
+#     # proxy-url: "direct" # 可选：为该凭据显式直连
+#     models:
+#       - name: "gpt-5-codex"   # 上游模型名
+#         alias: "codex-latest" # 客户端使用的别名，会映射到上游模型
+#     excluded-models:
+#       - "gpt-5.1"         # 排除指定模型（精确匹配）
+#       - "gpt-5-*"         # 通配前缀匹配（如 gpt-5-medium、gpt-5-codex）
+#       - "*-mini"          # 通配后缀匹配（如 gpt-5-codex-mini）
+#       - "*codex*"         # 通配子串匹配（如 gpt-5-codex-low）
+
+# Claude API keys
+# claude-api-key:
+#   - api-key: "sk-atSM..." # 使用官方 Claude API key 时，无需设置 base-url
+#   - api-key: "sk-atSM..."
+#     prefix: "test" # 可选：要求使用类似 "test/claude-sonnet-latest" 的调用方式命中该凭据
+#     base-url: "https://www.example.com" # 使用自定义 Claude API 端点
+#     headers:
+#       X-Custom-Header: "custom-value"
+#     proxy-url: "socks5://proxy.example.com:1080" # 可选：按 key 覆盖代理
+#     # proxy-url: "direct" # 可选：为该凭据显式直连
+#     models:
+#       - name: "claude-3-5-sonnet-20241022" # 上游模型名
+#         alias: "claude-sonnet-latest"      # 客户端使用的别名，会映射到上游模型
+#     excluded-models:
+#       - "claude-opus-4-5-20251101" # 排除指定模型（精确匹配）
+#       - "claude-3-*"               # 通配前缀匹配（如 claude-3-7-sonnet-20250219）
+#       - "*-thinking"               # 通配后缀匹配（如 claude-opus-4-5-thinking）
+#       - "*haiku*"                  # 通配子串匹配（如 claude-3-5-haiku-20241022）
+#     cloak:                         # 可选：为非 Claude Code 客户端启用请求伪装
+#       mode: "auto"                 # "auto"（默认）：仅在客户端不是 Claude Code 时伪装
+#                                    # "always"：始终启用伪装
+#                                    # "never"：永不伪装
+#       strict-mode: false           # false（默认）：将 Claude Code prompt 追加到用户 system messages 前
+#                                    # true：移除所有用户 system messages，仅保留 Claude Code prompt
+#       sensitive-words:             # 可选：使用零宽字符混淆的敏感词
+#         - "API"
+#         - "proxy"
+#       cache-user-id: true          # 可选：默认 false；设为 true 时，复用每个 API key 已缓存的 user_id，而不是每次请求随机生成
+#     experimental-cch-signing: false # 可选：默认 false；为 true 时，使用当前 Claude Code cch 算法为最终 /v1/messages body 签名
+#                                     # 除非你明确需要该行为，否则建议保持关闭，以便在上游 seed 变化时回退到旧代理行为
+
+# Claude API 请求的默认 header。Claude Code 发布新版本后可按需更新。
+# 在 legacy 模式下，当客户端未发送对应 header 时，
+# user-agent/package-version/runtime-version/timeout 会作为兜底值，而 OS/arch 仍来自运行时。
+# 当启用 stabilize-device-profile 后，OS/arch 会固定为下方基线值，
+# user-agent/package-version/runtime-version 则作为软件指纹种子，
+# 仍可升级到更新版本的官方 Claude 客户端。
+# claude-header-defaults:
+#   user-agent: "claude-cli/2.1.44 (external, sdk-cli)"
+#   package-version: "0.74.0"
+#   runtime-version: "v24.3.0"
+#   os: "MacOS"
+#   arch: "arm64"
+#   timeout: "600"
+#   stabilize-device-profile: false  # 可选，默认 false；设为 true 时启用按 auth/API key 固定指纹
+
+# Codex OAuth 模型请求的默认 header。
+# 仅在文件型 / OAuth Codex 请求且客户端未发送对应 header 时使用。
+# `user-agent` 同时作用于 HTTP 和 websocket 请求；
+# `beta-features` 仅作用于 websocket 请求。它们不作用于 codex-api-key 条目。
+# codex-header-defaults:
+#   user-agent: "codex_cli_rs/0.114.0 (Mac OS 14.2.0; x86_64) vscode/1.111.0"
+#   beta-features: "multi_agent"
+
+# OpenAI compatibility providers
+# openai-compatibility:
+#   - name: "openrouter" # provider 名称，会用于 user agent 等位置
+#     disabled: false # 可选：设为 true 可禁用该 provider，而无需删除配置
+#     prefix: "test" # 可选：要求使用类似 "test/kimi-k2" 的调用方式命中该 provider 的凭据
+#     base-url: "https://openrouter.ai/api/v1" # provider 的基础 URL
+#     headers:
+#       X-Custom-Header: "custom-value"
+#     api-key-entries:
+#       - api-key: "sk-or-v1-...b780"
+#         proxy-url: "socks5://proxy.example.com:1080" # 可选：按 key 覆盖代理
+#         # proxy-url: "direct" # 可选：为该凭据显式直连
+#       - api-key: "sk-or-v1-...b781" # 不设置 proxy-url
+#     models: # 该 provider 支持的模型
+#       - name: "moonshotai/kimi-k2:free" # 实际上游模型名
+#         alias: "kimi-k2"               # API 中使用的别名
+#         thinking:                      # 可选：省略时默认使用 levels ["low","medium","high"]
+#           levels: ["low", "medium", "high"]
+#       # 你可以重复使用同一个 alias，构建一个内部模型池。
+#       # 客户端在模型列表里仍然只会看到一个 alias。
+#       # 对该 alias 的请求会在下方多个上游模型之间轮询，
+#       # 如果选中的上游在产生输出前失败，请求会继续切到同一 alias 池中的下一个上游模型。
+#       - name: "deepseek-v3.1"
+#         alias: "claude-opus-4.66"
+#       - name: "glm-5"
+#         alias: "claude-opus-4.66"
+#       - name: "kimi-k2.5"
+#         alias: "claude-opus-4.66"
+
+# Vertex API keys（Vertex 兼容端点，base-url 可选）
+# vertex-api-key:
+#   - api-key: "vk-123..."                        # x-goog-api-key header
+#     prefix: "test"                              # 可选：要求使用类似 "test/vertex-pro" 的调用方式命中该凭据
+#     base-url: "https://example.com/api"         # 可选，例如 https://zenmux.ai/api；省略时回退到 Google Vertex
+#     proxy-url: "socks5://proxy.example.com:1080" # 可选：按 key 覆盖代理
+#     # proxy-url: "direct" # 可选：为该凭据显式直连
+#     headers:
+#       X-Custom-Header: "custom-value"
+#     models:                                     # 可选：将别名映射到上游模型名
+#       - name: "gemini-2.5-flash"                # 上游模型名
+#         alias: "vertex-flash"                   # 客户端可见别名
+#       - name: "gemini-2.5-pro"
+#         alias: "vertex-pro"
+#     excluded-models:                            # 可选：从模型列表中排除这些模型
+#       - "imagen-3.0-generate-002"
+#       - "imagen-*"
+
+# Amp 集成
+# ampcode:
+#   # 为 Amp CLI OAuth 和管理特性配置上游 URL
+#   upstream-url: "https://ampcode.com"
+#   # 可选：覆盖 Amp 上游 API key（否则使用环境变量或文件）
+#   upstream-api-key: ""
+#   # 按客户端划分的上游 API key 映射
+#   # 将客户端 API keys（来自顶层 api-keys）映射到不同的 Amp 上游 API key。
+#   # 适用于不同客户端分别使用不同 Amp 账号/配额的场景。
+#   # 如果某个客户端 key 没有命中映射，则回退到 upstream-api-key（默认行为）。
+#   upstream-api-keys:
+#     - upstream-api-key: "amp_key_for_team_a"    # 这些客户端对应使用的上游 key
+#       api-keys:                                 # 使用该上游 key 的客户端 keys
+#         - "your-api-key-1"
+#         - "your-api-key-2"
+#     - upstream-api-key: "amp_key_for_team_b"
+#       api-keys:
+#         - "your-api-key-3"
+#   # 将 Amp 管理路由（/api/auth、/api/user 等）限制为仅 localhost 可访问（默认：false）
+#   restrict-management-to-localhost: false
+#   # 在检查本地 API key 前，强制先执行模型映射（默认：false）
+#   force-model-mappings: false
+#   # Amp 模型映射
+#   # 将 Amp 中不可用的模型路由到你本地代理中可用的替代模型。
+#   # 适用于 Amp CLI 请求了你无权限访问的模型（例如 Claude Opus 4.5），
+#   # 但你有其他近似可用模型（例如 Claude Sonnet 4）的场景。
+#   model-mappings:
+#     - from: "claude-opus-4-5-20251101"          # Amp CLI 请求的模型
+#       to: "gemini-claude-opus-4-5-thinking"     # 改为路由到这个可用模型
+#     - from: "claude-sonnet-4-5-20250929"
+#       to: "gemini-claude-sonnet-4-5-thinking"
+#     - from: "claude-haiku-4-5-20251001"
+#       to: "gemini-2.5-flash"
+
+# 全局 OAuth 模型名称别名（按 channel 配置）
+# 这些别名会同时影响模型列表和请求路由。
+# 支持的 channels：gemini-cli、vertex、aistudio、antigravity、claude、codex、kimi。
+# 注意：这些别名不会作用于 gemini-api-key、codex-api-key、claude-api-key、openai-compatibility、vertex-api-key 或 ampcode。
+# 注意：由于别名会影响合并后的 /v1 模型列表和合并请求路由，不同 provider 间如果出现同名客户端模型，可能造成歧义。
+# /api/provider/{provider}/... 可以帮助你选择协议层，但最终推理后端仍可能按解析后的 model/alias 继续路由。
+# 如果需要严格固定后端，请使用唯一的 alias / prefix，或避免名称重叠。
+# 你可以对同一个 name 配置多个 alias，以暴露多个客户端模型名。
+# oauth-model-alias:
+#   gemini-cli:
+#     - name: "gemini-2.5-pro"          # 该 channel 下的原始模型名
+#       alias: "g2.5p"                  # 客户端可见别名
+#       fork: true                      # 为 true 时，保留原模型名并额外增加 alias 作为新模型（默认：false）
+#   vertex:
+#     - name: "gemini-2.5-pro"
+#       alias: "g2.5p"
+#   aistudio:
+#     - name: "gemini-2.5-pro"
+#       alias: "g2.5p"
+#   antigravity:
+#     - name: "gemini-3-pro-high"
+#       alias: "gemini-3-pro-preview"
+#   claude:
+#     - name: "claude-sonnet-4-5-20250929"
+#       alias: "cs4.5"
+#   codex:
+#     - name: "gpt-5"
+#       alias: "g5"
+#   kimi:
+#     - name: "kimi-k2.5"
+#       alias: "k2.5"
+
+# OAuth provider 级别的排除模型
+# oauth-excluded-models:
+#   gemini-cli:
+#     - "gemini-2.5-pro"     # 排除指定模型（精确匹配）
+#     - "gemini-2.5-*"       # 通配前缀匹配（如 gemini-2.5-flash、gemini-2.5-pro）
+#     - "*-preview"          # 通配后缀匹配（如 gemini-3-pro-preview）
+#     - "*flash*"            # 通配子串匹配（如 gemini-2.5-flash-lite）
+#   vertex:
+#     - "gemini-3-pro-preview"
+#   aistudio:
+#     - "gemini-3-pro-preview"
+#   antigravity:
+#     - "gemini-3-pro-preview"
+#   claude:
+#     - "claude-3-5-haiku-20241022"
+#   codex:
+#     - "gpt-5-codex-mini"
+#   kimi:
+#     - "kimi-k2-thinking"
+
+# 可选的 payload 配置
+# payload:
+#   default: # 默认规则仅在 payload 中缺少参数时设置
+#     - models:
+#         - name: "gemini-2.5-pro" # 支持通配符（如 "gemini-*"）
+#           protocol: "gemini" # 将规则限制到特定协议，可选：openai、gemini、claude、codex、antigravity
+#       params: # JSON path（gjson/sjson 语法）-> value
+#         "generationConfig.thinkingConfig.thinkingBudget": 32768
+#   default-raw: # 默认 raw 规则会在参数缺失时以原始 JSON 写入（必须是合法 JSON）
+#     - models:
+#         - name: "gemini-2.5-pro" # 支持通配符（如 "gemini-*"）
+#           protocol: "gemini" # 将规则限制到特定协议，可选：openai、gemini、claude、codex、antigravity
+#       params: # JSON path（gjson/sjson 语法）-> 原始 JSON value（字符串原样使用，必须是合法 JSON）
+#         "generationConfig.responseJsonSchema": "{\"type\":\"object\",\"properties\":{\"answer\":{\"type\":\"string\"}}}"
+#   override: # 覆盖规则总是写入参数，会覆盖任何已有值
+#     - models:
+#         - name: "gpt-*" # 支持通配符（如 "gpt-*"）
+#           protocol: "codex" # 将规则限制到特定协议，可选：openai、gemini、claude、codex、antigravity
+#       params: # JSON path（gjson/sjson 语法）-> value
+#         "reasoning.effort": "high"
+#   override-raw: # 覆盖 raw 规则总是以原始 JSON 写入参数（必须是合法 JSON）
+#     - models:
+#         - name: "gpt-*" # 支持通配符（如 "gpt-*"）
+#           protocol: "codex" # 将规则限制到特定协议，可选：openai、gemini、claude、codex、antigravity
+#       params: # JSON path（gjson/sjson 语法）-> 原始 JSON value（字符串原样使用，必须是合法 JSON）
+#         "response_format": "{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"answer\",\"schema\":{\"type\":\"object\"}}}"
+#   filter: # 过滤规则会从 payload 中移除指定参数
+#     - models:
+#         - name: "gemini-2.5-pro" # 支持通配符（如 "gemini-*"）
+#           protocol: "gemini" # 将规则限制到特定协议，可选：openai、gemini、claude、codex、antigravity
+#       params: # 要从 payload 中移除的 JSON paths（gjson/sjson 语法）
+#         - "generationConfig.thinkingConfig.thinkingBudget"
+#         - "generationConfig.responseJsonSchema"

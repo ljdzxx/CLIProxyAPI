@@ -1,0 +1,42 @@
+app = "your-cliproxyapi-app"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  DEPLOY = "cloud"
+  HOME = "/data"
+  TZ = "Asia/Shanghai"
+  WRITABLE_PATH = "/data"
+
+[processes]
+  app = "/bin/sh -c 'if [ ! -f /data/config.yaml ]; then cp /CLIProxyAPI/config.example.yaml /data/config.yaml; fi; exec /CLIProxyAPI/CLIProxyAPI --config /data/config.yaml'"
+
+[http_service]
+  internal_port = 8317
+  force_https = true
+  auto_start_machines = true
+  auto_stop_machines = "off"
+  min_machines_running = 1
+  processes = ["app"]
+
+  [http_service.concurrency]
+    type = "connections"
+    soft_limit = 100
+    hard_limit = 200
+
+  [[http_service.checks]]
+    grace_period = "20s"
+    interval = "15s"
+    method = "GET"
+    path = "/healthz"
+    timeout = "5s"
+
+[[mounts]]
+  source = "cliproxyapi_data"
+  destination = "/data"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 1024

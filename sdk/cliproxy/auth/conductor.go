@@ -17,12 +17,14 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -50,6 +52,7 @@ type ExecutionSessionCloser interface {
 }
 
 const (
+	homeAuthCountMetadataKey = "__cliproxy_home_auth_count"
 	// CloseAllExecutionSessionsID asks an executor to release all active execution sessions.
 	// Executors that do not support this marker may ignore it.
 	CloseAllExecutionSessionsID = "__all_execution_sessions__"
@@ -387,6 +390,15 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 }
 
+// HomeEnabled reports whether the home control plane integration is enabled in the runtime config.
+func (m *Manager) HomeEnabled() bool {
+	if m == nil {
+		return false
+	}
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	return cfg != nil && cfg.Home.Enabled
+}
+
 func (m *Manager) lookupAPIKeyUpstreamModel(authID, requestedModel string) string {
 	if m == nil {
 		return ""
@@ -532,6 +544,11 @@ func preserveRequestedModelSuffix(requestedModel, resolved string) string {
 }
 
 func (m *Manager) executionModelCandidates(auth *Auth, routeModel string) []string {
+	if auth != nil && auth.Attributes != nil {
+		if homeModel := strings.TrimSpace(auth.Attributes[homeUpstreamModelAttributeKey]); homeModel != "" {
+			return []string{homeModel}
+		}
+	}
 	requestedModel := rewriteModelForAuth(routeModel, auth)
 	requestedModel = m.applyOAuthModelAlias(auth, requestedModel)
 	if pool := m.resolveOpenAICompatUpstreamModelPool(auth, requestedModel); len(pool) > 0 {
@@ -565,6 +582,14 @@ func (m *Manager) selectionModelKeyForAuth(auth *Auth, routeModel string) string
 }
 
 func (m *Manager) stateModelForExecution(auth *Auth, routeModel, upstreamModel string, pooled bool) string {
+	if auth != nil && auth.Attributes != nil {
+		if homeModel := strings.TrimSpace(auth.Attributes[homeUpstreamModelAttributeKey]); homeModel != "" {
+			if resolved := strings.TrimSpace(upstreamModel); resolved != "" {
+				return resolved
+			}
+			return homeModel
+		}
+	}
 	stateModel := executionResultModel(routeModel, upstreamModel, pooled)
 	selectionModel := m.selectionModelForAuth(auth, routeModel)
 	if canonicalModelKey(selectionModel) == canonicalModelKey(upstreamModel) && strings.TrimSpace(selectionModel) != "" {
@@ -838,6 +863,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 	if executor == nil {
 		return nil, &Error{Code: "executor_not_found", Message: "executor not registered"}
 	}
+	ctx = contextWithRequestedModelAlias(ctx, opts, routeModel)
 	var lastErr error
 	for idx, execModel := range execModels {
 		resultModel := m.stateModelForExecution(auth, routeModel, execModel, pooled)
@@ -1137,6 +1163,9 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 			auth.Index = existing.Index
 			auth.indexAssigned = existing.indexAssigned
 		}
+		auth.Success = existing.Success
+		auth.Failed = existing.Failed
+		auth.recentRequests = existing.recentRequests
 		if !existing.Disabled && existing.Status != StatusDisabled && !auth.Disabled && auth.Status != StatusDisabled {
 			if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
 				auth.ModelStates = existing.ModelStates
@@ -1299,19 +1328,25 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 	}
 	routeModel := req.Model
 	opts = ensureRequestedModelMetadata(opts, routeModel)
+	homeMode := m.HomeEnabled()
+	homeAuthCount := 1
 	tried := make(map[string]struct{})
 	attempted := make(map[string]struct{})
 	var lastErr error
 	for {
-		if maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials {
+		if !homeMode && maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials {
 			if lastErr != nil {
 				return cliproxyexecutor.Response{}, lastErr
 			}
 			return cliproxyexecutor.Response{}, &Error{Code: "auth_not_found", Message: "no auth available"}
 		}
-		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, opts, tried)
+		pickOpts := opts
+		if homeMode {
+			pickOpts = withHomeAuthCount(opts, homeAuthCount)
+		}
+		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, pickOpts, tried)
 		if errPick != nil {
-			if lastErr != nil {
+			if shouldReturnLastErrorOnPickFailure(homeMode, lastErr, errPick) {
 				return cliproxyexecutor.Response{}, lastErr
 			}
 			return cliproxyexecutor.Response{}, errPick
@@ -1327,6 +1362,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
+		execCtx = contextWithRequestedModelAlias(execCtx, opts, routeModel)
 
 		models, pooled := m.preparedExecutionModels(auth, routeModel)
 		if len(models) == 0 {
@@ -1366,6 +1402,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				return cliproxyexecutor.Response{}, authErr
 			}
 			lastErr = authErr
+			if homeMode {
+				homeAuthCount++
+			}
 			continue
 		}
 	}
@@ -1377,19 +1416,25 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 	}
 	routeModel := req.Model
 	opts = ensureRequestedModelMetadata(opts, routeModel)
+	homeMode := m.HomeEnabled()
+	homeAuthCount := 1
 	tried := make(map[string]struct{})
 	attempted := make(map[string]struct{})
 	var lastErr error
 	for {
-		if maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials {
+		if !homeMode && maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials {
 			if lastErr != nil {
 				return cliproxyexecutor.Response{}, lastErr
 			}
 			return cliproxyexecutor.Response{}, &Error{Code: "auth_not_found", Message: "no auth available"}
 		}
-		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, opts, tried)
+		pickOpts := opts
+		if homeMode {
+			pickOpts = withHomeAuthCount(opts, homeAuthCount)
+		}
+		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, pickOpts, tried)
 		if errPick != nil {
-			if lastErr != nil {
+			if shouldReturnLastErrorOnPickFailure(homeMode, lastErr, errPick) {
 				return cliproxyexecutor.Response{}, lastErr
 			}
 			return cliproxyexecutor.Response{}, errPick
@@ -1405,6 +1450,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
+		execCtx = contextWithRequestedModelAlias(execCtx, opts, routeModel)
 
 		models, pooled := m.preparedExecutionModels(auth, routeModel)
 		if len(models) == 0 {
@@ -1444,6 +1490,9 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				return cliproxyexecutor.Response{}, authErr
 			}
 			lastErr = authErr
+			if homeMode {
+				homeAuthCount++
+			}
 			continue
 		}
 	}
@@ -1455,19 +1504,25 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	}
 	routeModel := req.Model
 	opts = ensureRequestedModelMetadata(opts, routeModel)
+	homeMode := m.HomeEnabled()
+	homeAuthCount := 1
 	tried := make(map[string]struct{})
 	attempted := make(map[string]struct{})
 	var lastErr error
 	for {
-		if maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials {
+		if !homeMode && maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials {
 			if lastErr != nil {
 				return nil, lastErr
 			}
 			return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 		}
-		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, opts, tried)
+		pickOpts := opts
+		if homeMode {
+			pickOpts = withHomeAuthCount(opts, homeAuthCount)
+		}
+		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, pickOpts, tried)
 		if errPick != nil {
-			if lastErr != nil {
+			if shouldReturnLastErrorOnPickFailure(homeMode, lastErr, errPick) {
 				return nil, lastErr
 			}
 			return nil, errPick
@@ -1497,6 +1552,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				return nil, errStream
 			}
 			lastErr = errStream
+			if homeMode {
+				homeAuthCount++
+			}
 			continue
 		}
 		return streamResult, nil
@@ -1524,6 +1582,40 @@ func ensureRequestedModelMetadata(opts cliproxyexecutor.Options, requestedModel 
 	return opts
 }
 
+func withHomeAuthCount(opts cliproxyexecutor.Options, count int) cliproxyexecutor.Options {
+	if count <= 0 {
+		count = 1
+	}
+	meta := make(map[string]any, len(opts.Metadata)+1)
+	for k, v := range opts.Metadata {
+		meta[k] = v
+	}
+	meta[homeAuthCountMetadataKey] = count
+	opts.Metadata = meta
+	return opts
+}
+
+func homeAuthCountFromMetadata(meta map[string]any) int {
+	if len(meta) == 0 {
+		return 1
+	}
+	switch value := meta[homeAuthCountMetadataKey].(type) {
+	case int:
+		if value > 0 {
+			return value
+		}
+	case int64:
+		if value > 0 {
+			return int(value)
+		}
+	case float64:
+		if value > 0 {
+			return int(value)
+		}
+	}
+	return 1
+}
+
 func hasRequestedModelMetadata(meta map[string]any) bool {
 	if len(meta) == 0 {
 		return false
@@ -1539,6 +1631,36 @@ func hasRequestedModelMetadata(meta map[string]any) bool {
 		return strings.TrimSpace(string(v)) != ""
 	default:
 		return false
+	}
+}
+
+func contextWithRequestedModelAlias(ctx context.Context, opts cliproxyexecutor.Options, fallback string) context.Context {
+	alias := requestedModelAliasFromOptions(opts, fallback)
+	return coreusage.WithRequestedModelAlias(ctx, alias)
+}
+
+func requestedModelAliasFromOptions(opts cliproxyexecutor.Options, fallback string) string {
+	fallback = strings.TrimSpace(fallback)
+	if len(opts.Metadata) == 0 {
+		return fallback
+	}
+	raw, ok := opts.Metadata[cliproxyexecutor.RequestedModelMetadataKey]
+	if !ok || raw == nil {
+		return fallback
+	}
+	switch value := raw.(type) {
+	case string:
+		if strings.TrimSpace(value) == "" {
+			return fallback
+		}
+		return strings.TrimSpace(value)
+	case []byte:
+		if len(value) == 0 {
+			return fallback
+		}
+		return strings.TrimSpace(string(value))
+	default:
+		return fallback
 	}
 }
 
@@ -2032,6 +2154,12 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	m.mu.Lock()
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
 		now := time.Now()
+		auth.recordRecentRequest(now, result.Success)
+		if result.Success {
+			auth.Success++
+		} else {
+			auth.Failed++
+		}
 
 		if result.Success {
 			if result.Model != "" {
@@ -2678,6 +2806,11 @@ func (m *Manager) routeAwareSelectionRequired(auth *Auth, routeModel string) boo
 }
 
 func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
+	if m.HomeEnabled() {
+		auth, exec, _, err := m.pickNextViaHome(ctx, model, opts)
+		return auth, exec, err
+	}
+
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
 	disallowFreeAuth := disallowFreeAuthFromMetadata(opts.Metadata)
 
@@ -2747,6 +2880,11 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 }
 
 func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
+	if m.HomeEnabled() {
+		auth, exec, _, err := m.pickNextViaHome(ctx, model, opts)
+		return auth, exec, err
+	}
+
 	if !m.useSchedulerFastPath() {
 		return m.pickNextLegacy(ctx, provider, model, opts, tried)
 	}
@@ -2804,6 +2942,10 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 }
 
 func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
+	if m.HomeEnabled() {
+		return m.pickNextViaHome(ctx, model, opts)
+	}
+
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
 	disallowFreeAuth := disallowFreeAuthFromMetadata(opts.Metadata)
 
@@ -2896,6 +3038,10 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 }
 
 func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
+	if m.HomeEnabled() {
+		return m.pickNextViaHome(ctx, model, opts)
+	}
+
 	if !m.useSchedulerFastPath() {
 		return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
 	}
@@ -2978,6 +3124,170 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 		}
 		return authCopy, executor, providerKey, nil
 	}
+}
+
+type homeErrorEnvelope struct {
+	Error *homeErrorDetail `json:"error"`
+}
+
+type homeErrorDetail struct {
+	Type    string `json:"type"`
+	Message string `json:"message"`
+	Code    string `json:"code,omitempty"`
+}
+
+const (
+	homeUpstreamModelAttributeKey     = "home_upstream_model"
+	homeRequestRetryExceededErrorCode = "request_retry_exceeded"
+)
+
+func isHomeRequestRetryExceededError(err error) bool {
+	var authErr *Error
+	if !errors.As(err, &authErr) || authErr == nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(authErr.Code), homeRequestRetryExceededErrorCode)
+}
+
+func shouldReturnLastErrorOnPickFailure(homeMode bool, lastErr error, errPick error) bool {
+	if lastErr == nil {
+		return false
+	}
+	if !homeMode {
+		return true
+	}
+	return isHomeRequestRetryExceededError(errPick)
+}
+
+type homeAuthDispatchResponse struct {
+	Model      string `json:"model"`
+	Provider   string `json:"provider"`
+	AuthIndex  string `json:"auth_index"`
+	UserAPIKey string `json:"user_api_key"`
+	Auth       Auth   `json:"auth"`
+}
+
+func setHomeUserAPIKeyOnGinContext(ctx context.Context, apiKey string) {
+	apiKey = strings.TrimSpace(apiKey)
+	if apiKey == "" || ctx == nil {
+		return
+	}
+	ginCtx, ok := ctx.Value("gin").(interface{ Set(string, any) })
+	if !ok || ginCtx == nil {
+		return
+	}
+	ginCtx.Set("userApiKey", apiKey)
+}
+
+func (m *Manager) pickNextViaHome(ctx context.Context, model string, opts cliproxyexecutor.Options) (*Auth, ProviderExecutor, string, error) {
+	if m == nil {
+		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	client := home.Current()
+	if client == nil || !client.HeartbeatOK() {
+		return nil, nil, "", &Error{Code: "home_unavailable", Message: "home control center unavailable", HTTPStatus: http.StatusServiceUnavailable}
+	}
+
+	requestedModel := requestedModelFromMetadata(opts.Metadata, model)
+	sessionID := ExtractSessionID(opts.Headers, opts.OriginalRequest, opts.Metadata)
+	count := homeAuthCountFromMetadata(opts.Metadata)
+
+	raw, err := client.RPopAuth(ctx, requestedModel, sessionID, opts.Headers, count)
+	if err != nil {
+		return nil, nil, "", &Error{Code: "auth_not_found", Message: err.Error(), HTTPStatus: http.StatusServiceUnavailable}
+	}
+
+	var env homeErrorEnvelope
+	if errUnmarshal := json.Unmarshal(raw, &env); errUnmarshal == nil && env.Error != nil {
+		code := strings.TrimSpace(env.Error.Type)
+		if code == "" {
+			code = strings.TrimSpace(env.Error.Code)
+		}
+		msg := strings.TrimSpace(env.Error.Message)
+		if msg == "" {
+			msg = "home returned error"
+		}
+		status := http.StatusBadGateway
+		switch strings.ToLower(code) {
+		case "model_not_found":
+			status = http.StatusNotFound
+		case "authentication_error", "unauthorized":
+			status = http.StatusUnauthorized
+		}
+		return nil, nil, "", &Error{Code: code, Message: msg, HTTPStatus: status}
+	}
+
+	var dispatch homeAuthDispatchResponse
+	if errUnmarshal := json.Unmarshal(raw, &dispatch); errUnmarshal != nil {
+		return nil, nil, "", &Error{Code: "invalid_auth", Message: "home returned invalid auth payload", HTTPStatus: http.StatusBadGateway}
+	}
+	setHomeUserAPIKeyOnGinContext(ctx, dispatch.UserAPIKey)
+	auth := dispatch.Auth
+	if strings.TrimSpace(auth.ID) == "" {
+		// Backward compatibility: older home instances returned the auth directly.
+		if errUnmarshal := json.Unmarshal(raw, &auth); errUnmarshal != nil {
+			return nil, nil, "", &Error{Code: "invalid_auth", Message: "home returned invalid auth payload", HTTPStatus: http.StatusBadGateway}
+		}
+	}
+	if upstreamModel := strings.TrimSpace(dispatch.Model); upstreamModel != "" {
+		if auth.Attributes == nil {
+			auth.Attributes = make(map[string]string, 1)
+		}
+		auth.Attributes[homeUpstreamModelAttributeKey] = upstreamModel
+	}
+	if strings.TrimSpace(auth.ID) == "" {
+		return nil, nil, "", &Error{Code: "invalid_auth", Message: "home returned auth without id", HTTPStatus: http.StatusBadGateway}
+	}
+	providerKey := strings.ToLower(strings.TrimSpace(auth.Provider))
+	if providerKey == "" {
+		return nil, nil, "", &Error{Code: "invalid_auth", Message: "home returned auth without provider", HTTPStatus: http.StatusBadGateway}
+	}
+
+	homeAuthIndex := strings.TrimSpace(dispatch.AuthIndex)
+	if homeAuthIndex != "" {
+		auth.Index = homeAuthIndex
+		auth.indexAssigned = true
+	} else {
+		auth.EnsureIndex()
+	}
+
+	executor, ok := m.Executor(providerKey)
+	if !ok && auth.Attributes != nil && strings.TrimSpace(auth.Attributes["base_url"]) != "" {
+		executor, ok = m.Executor("openai-compatibility")
+		if ok {
+			providerKey = "openai-compatibility"
+		}
+	}
+	if !ok {
+		return nil, nil, "", &Error{Code: "executor_not_found", Message: "executor not registered", HTTPStatus: http.StatusBadGateway}
+	}
+
+	return auth.Clone(), executor, providerKey, nil
+}
+
+func requestedModelFromMetadata(metadata map[string]any, fallback string) string {
+	if metadata != nil {
+		if v, ok := metadata[cliproxyexecutor.RequestedModelMetadataKey]; ok {
+			switch typed := v.(type) {
+			case string:
+				if trimmed := strings.TrimSpace(typed); trimmed != "" {
+					return trimmed
+				}
+			case []byte:
+				if trimmed := strings.TrimSpace(string(typed)); trimmed != "" {
+					return trimmed
+				}
+			}
+		}
+	}
+	fallback = strings.TrimSpace(fallback)
+	if fallback == "" {
+		return "unknown"
+	}
+	return fallback
 }
 
 func (m *Manager) findAllAntigravityCreditsCandidateAuths(routeModel string, opts cliproxyexecutor.Options) []creditsCandidateEntry {
@@ -3098,6 +3408,7 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 			creditsCtx = context.WithValue(creditsCtx, "cliproxy.roundtripper", rt)
 		}
 		creditsOpts := ensureRequestedModelMetadata(opts, routeModel)
+		creditsCtx = contextWithRequestedModelAlias(creditsCtx, creditsOpts, routeModel)
 		publishSelectedAuthMetadata(creditsOpts.Metadata, c.auth.ID)
 		models := m.executionModelCandidates(c.auth, routeModel)
 		if len(models) == 0 {
@@ -3342,7 +3653,7 @@ func authRefreshTokenLocked(auth *Auth) bool {
 }
 
 func (m *Manager) shouldRefresh(a *Auth, now time.Time) bool {
-	if a == nil || a.Disabled {
+	if a == nil {
 		return false
 	}
 	if !a.NextRefreshAfter.IsZero() && now.Before(a.NextRefreshAfter) {
@@ -3549,7 +3860,7 @@ func lookupMetadataTime(meta map[string]any, keys ...string) (time.Time, bool) {
 func (m *Manager) markRefreshPending(id string, now time.Time) bool {
 	m.mu.Lock()
 	auth, ok := m.auths[id]
-	if !ok || auth == nil || auth.Disabled {
+	if !ok || auth == nil {
 		m.mu.Unlock()
 		return false
 	}

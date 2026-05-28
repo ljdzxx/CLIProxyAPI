@@ -1,0 +1,26 @@
+services:
+  cli-proxy-api-8318:
+    image: ${CLI_PROXY_IMAGE:-eceasy/cli-proxy-api:latest}
+    pull_policy: always
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VERSION: ${VERSION:-dev}
+        COMMIT: ${COMMIT:-none}
+        BUILD_DATE: ${BUILD_DATE:-unknown}
+    container_name: cli-proxy-api-8318
+    environment:
+      DEPLOY: ${DEPLOY:-}
+    ports:
+      - "8318:8317"
+      - "8086:8085"
+      - "1456:1455"
+      - "54546:54545"
+      - "51122:51121"
+      - "11452:11451"
+    volumes:
+      - ./config-8318.yaml:/CLIProxyAPI/config.yaml
+      - ./auths-8318:/root/.cli-proxy-api
+      - ./logs-8318:/CLIProxyAPI/logs
+    restart: unless-stopped

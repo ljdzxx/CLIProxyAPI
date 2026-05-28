@@ -159,15 +159,17 @@ func (NoopHook) OnResult(context.Context, Result) {}
 
 // Manager orchestrates auth lifecycle, selection, execution, and persistence.
 type Manager struct {
-	store      Store
-	executors  map[string]ProviderExecutor
-	selector   Selector
-	hook       Hook
-	mu         sync.RWMutex
-	auths      map[string]*Auth
-	scheduler  *authScheduler
-	refreshMu  sync.Mutex
-	refreshing map[string]struct{}
+	store       Store
+	executors   map[string]ProviderExecutor
+	selector    Selector
+	hook        Hook
+	mu          sync.RWMutex
+	auths       map[string]*Auth
+	scheduler   *authScheduler
+	refreshMu   sync.Mutex
+	refreshing  map[string]struct{}
+	rateLimitMu sync.Mutex
+	rateLimits  map[string]authRateLimitWindow
 	// homeRuntimeAuths caches auths returned by Home so websocket sessions can
 	// reuse an established upstream credential without dispatching every turn.
 	homeRuntimeAuths map[string]map[string]*Auth
@@ -218,6 +220,7 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		hook:             hook,
 		auths:            make(map[string]*Auth),
 		refreshing:       make(map[string]struct{}),
+		rateLimits:       make(map[string]authRateLimitWindow),
 		homeRuntimeAuths: make(map[string]map[string]*Auth),
 		providerOffsets:  make(map[string]int),
 		modelPoolOffsets: make(map[string]int),
@@ -1228,6 +1231,9 @@ func (m *Manager) Load(ctx context.Context) error {
 	}
 	m.rebuildAPIKeyModelAliasLocked(cfg)
 	m.mu.Unlock()
+	m.rateLimitMu.Lock()
+	m.rateLimits = make(map[string]authRateLimitWindow)
+	m.rateLimitMu.Unlock()
 	m.syncScheduler()
 	return nil
 }
@@ -2231,6 +2237,10 @@ func (m *Manager) shouldRetryAfterError(err error, attempt int, providers []stri
 	if isRequestInvalidError(err) {
 		return 0, false
 	}
+	var localRateLimitErr *authRateLimitError
+	if errors.As(err, &localRateLimitErr) {
+		return 0, false
+	}
 	wait, found := m.closestCooldownWait(providers, model, attempt)
 	if found {
 		if wait > maxWait {
@@ -3013,6 +3023,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		}
 	}
 	registryRef := registry.GetGlobalRegistry()
+	var earliestRateLimitReset time.Time
 	for _, candidate := range m.auths {
 		if candidate.Provider != provider || candidate.Disabled {
 			continue
@@ -3029,10 +3040,17 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
 			continue
 		}
+		if okRate, resetAt := m.authRateLimitAvailable(candidate, time.Now()); !okRate {
+			earliestRateLimitReset = earlierRateLimitReset(earliestRateLimitReset, resetAt)
+			continue
+		}
 		candidates = append(candidates, candidate)
 	}
 	if len(candidates) == 0 {
 		m.mu.RUnlock()
+		if !earliestRateLimitReset.IsZero() {
+			return nil, nil, newAuthRateLimitError(model, earliestRateLimitReset)
+		}
 		return nil, nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
 	available, errAvailable := m.availableAuthsForRouteModel(candidates, provider, model, time.Now())
@@ -3048,6 +3066,13 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	if selected == nil {
 		m.mu.RUnlock()
 		return nil, nil, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
+	}
+	if tried == nil {
+		tried = make(map[string]struct{})
+	}
+	if !m.reserveAuthForSelection(selected, tried, &earliestRateLimitReset) {
+		m.mu.RUnlock()
+		return m.pickNextLegacy(ctx, provider, model, opts, tried)
 	}
 	authCopy := selected.Clone()
 	m.mu.RUnlock()
@@ -3092,6 +3117,7 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 		return nil, nil, &Error{Code: "executor_not_found", Message: "executor not registered"}
 	}
 	disallowFreeAuth := disallowFreeAuthFromMetadata(opts.Metadata)
+	var earliestRateLimitReset time.Time
 	for {
 		selected, errPick := m.scheduler.pickSingle(ctx, provider, model, opts, tried)
 		if errPick != nil && model != "" && shouldRetrySchedulerPick(errPick) {
@@ -3099,9 +3125,15 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 			selected, errPick = m.scheduler.pickSingle(ctx, provider, model, opts, tried)
 		}
 		if errPick != nil {
+			if !earliestRateLimitReset.IsZero() {
+				return nil, nil, newAuthRateLimitError(model, earliestRateLimitReset)
+			}
 			return nil, nil, errPick
 		}
 		if selected == nil {
+			if !earliestRateLimitReset.IsZero() {
+				return nil, nil, newAuthRateLimitError(model, earliestRateLimitReset)
+			}
 			return nil, nil, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
 		}
 		if disallowFreeAuth && isFreeCodexAuth(selected) {
@@ -3109,6 +3141,12 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 				tried = make(map[string]struct{})
 			}
 			tried[selected.ID] = struct{}{}
+			continue
+		}
+		if tried == nil {
+			tried = make(map[string]struct{})
+		}
+		if !m.reserveAuthForSelection(selected, tried, &earliestRateLimitReset) {
 			continue
 		}
 		authCopy := selected.Clone()
@@ -3155,6 +3193,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		}
 	}
 	registryRef := registry.GetGlobalRegistry()
+	var earliestRateLimitReset time.Time
 	for _, candidate := range m.auths {
 		if candidate == nil || candidate.Disabled {
 			continue
@@ -3181,10 +3220,17 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
 			continue
 		}
+		if okRate, resetAt := m.authRateLimitAvailable(candidate, time.Now()); !okRate {
+			earliestRateLimitReset = earlierRateLimitReset(earliestRateLimitReset, resetAt)
+			continue
+		}
 		candidates = append(candidates, candidate)
 	}
 	if len(candidates) == 0 {
 		m.mu.RUnlock()
+		if !earliestRateLimitReset.IsZero() {
+			return nil, nil, "", newAuthRateLimitError(model, earliestRateLimitReset)
+		}
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
 	available, errAvailable := m.availableAuthsForRouteModel(candidates, "mixed", model, time.Now())
@@ -3206,6 +3252,13 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	if !okExecutor {
 		m.mu.RUnlock()
 		return nil, nil, "", &Error{Code: "executor_not_found", Message: "executor not registered"}
+	}
+	if tried == nil {
+		tried = make(map[string]struct{})
+	}
+	if !m.reserveAuthForSelection(selected, tried, &earliestRateLimitReset) {
+		m.mu.RUnlock()
+		return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
 	}
 	authCopy := selected.Clone()
 	m.mu.RUnlock()
@@ -3273,6 +3326,7 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 	}
 
 	disallowFreeAuth := disallowFreeAuthFromMetadata(opts.Metadata)
+	var earliestRateLimitReset time.Time
 	for {
 		selected, providerKey, errPick := m.scheduler.pickMixed(ctx, eligibleProviders, model, opts, tried)
 		if errPick != nil && model != "" && shouldRetrySchedulerPick(errPick) {
@@ -3280,9 +3334,15 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 			selected, providerKey, errPick = m.scheduler.pickMixed(ctx, eligibleProviders, model, opts, tried)
 		}
 		if errPick != nil {
+			if !earliestRateLimitReset.IsZero() {
+				return nil, nil, "", newAuthRateLimitError(model, earliestRateLimitReset)
+			}
 			return nil, nil, "", errPick
 		}
 		if selected == nil {
+			if !earliestRateLimitReset.IsZero() {
+				return nil, nil, "", newAuthRateLimitError(model, earliestRateLimitReset)
+			}
 			return nil, nil, "", &Error{Code: "auth_not_found", Message: "selector returned no auth"}
 		}
 		if disallowFreeAuth && isFreeCodexAuth(selected) {
@@ -3290,6 +3350,12 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 				tried = make(map[string]struct{})
 			}
 			tried[selected.ID] = struct{}{}
+			continue
+		}
+		if tried == nil {
+			tried = make(map[string]struct{})
+		}
+		if !m.reserveAuthForSelection(selected, tried, &earliestRateLimitReset) {
 			continue
 		}
 		executor, okExecutor := m.Executor(providerKey)

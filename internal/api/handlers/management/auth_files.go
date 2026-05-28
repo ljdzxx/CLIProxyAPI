@@ -81,6 +81,23 @@ type authRefreshJob struct {
 	Failures   []authRefreshJobFailure `json:"failures,omitempty"`
 }
 
+type authFieldsJobFailure struct {
+	Name  string `json:"name"`
+	Error string `json:"error"`
+}
+
+type authFieldsJob struct {
+	ID         string                 `json:"id"`
+	Status     string                 `json:"status"`
+	StartedAt  time.Time              `json:"started_at"`
+	FinishedAt time.Time              `json:"finished_at,omitempty"`
+	Total      int                    `json:"total"`
+	Updated    int                    `json:"updated"`
+	Failed     int                    `json:"failed"`
+	Files      []string               `json:"files,omitempty"`
+	Failures   []authFieldsJobFailure `json:"failures,omitempty"`
+}
+
 func extractLastRefreshTimestamp(meta map[string]any) (time.Time, bool) {
 	if len(meta) == 0 {
 		return time.Time{}, false
@@ -426,6 +443,17 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	entry["success"] = auth.Success
 	entry["failed"] = auth.Failed
 	entry["recent_requests"] = auth.RecentRequestsSnapshot(time.Now())
+	if auth.LastError != nil {
+		entry["last_error"] = gin.H{
+			"code":        auth.LastError.Code,
+			"message":     auth.LastError.Message,
+			"retryable":   auth.LastError.Retryable,
+			"http_status": auth.LastError.HTTPStatus,
+		}
+		if auth.LastError.HTTPStatus > 0 {
+			entry["last_error_http_status"] = auth.LastError.HTTPStatus
+		}
+	}
 	if email := authEmail(auth); email != "" {
 		entry["email"] = email
 	}
@@ -506,7 +534,32 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	if websockets, ok := authWebsocketsValue(auth); ok {
 		entry["websockets"] = websockets
 	}
+	if maxRequests, ok := authMetadataIntValue(auth, "rate_limit_max_requests", "request_limit_max_requests"); ok {
+		entry["rate_limit_max_requests"] = maxRequests
+	}
+	if windowSeconds, ok := authMetadataIntValue(auth, "rate_limit_window_seconds", "request_limit_window_seconds"); ok {
+		entry["rate_limit_window_seconds"] = windowSeconds
+	}
 	return entry
+}
+
+func authMetadataIntValue(auth *coreauth.Auth, keys ...string) (int, bool) {
+	if auth == nil {
+		return 0, false
+	}
+	for _, key := range keys {
+		if auth.Metadata != nil {
+			if value, ok := authFileIntValue(auth.Metadata[key]); ok {
+				return value, true
+			}
+		}
+		if auth.Attributes != nil {
+			if value, ok := authFileIntValue(auth.Attributes[key]); ok {
+				return value, true
+			}
+		}
+	}
+	return 0, false
 }
 
 func authWebsocketsValue(auth *coreauth.Auth) (bool, bool) {
@@ -1668,57 +1721,17 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 
 	ctx := c.Request.Context()
 
-	// Find auth by name or ID
-	var targetAuth *coreauth.Auth
-	if auth, ok := h.authManager.GetByID(name); ok {
-		targetAuth = auth
-	} else {
-		auths := h.authManager.List()
-		for _, auth := range auths {
-			if auth.FileName == name {
-				targetAuth = auth
-				break
-			}
-		}
-	}
-
+	targetAuth := h.findAuthFileForFieldsPatch(name)
 	if targetAuth == nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
 		return
 	}
 
-	changed := false
-	touchedRoots := make(map[string]struct{}, len(req))
-	for key, rawValue := range req {
-		fieldPath := strings.TrimSpace(key)
-		if fieldPath == "" {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "field name is required"})
-			return
-		}
-		value, errDecode := decodeAuthFileFieldValue(rawValue)
-		if errDecode != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid field %s", fieldPath)})
-			return
-		}
-		if targetAuth.Metadata == nil {
-			targetAuth.Metadata = make(map[string]any)
-		}
-
-		if fieldPath == "headers" {
-			applyAuthFileHeadersPatch(targetAuth, value)
-		} else if errSet := setAuthFileMetadataValue(targetAuth.Metadata, fieldPath, value); errSet != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": errSet.Error()})
-			return
-		}
-		if root := rootAuthFileField(fieldPath); root != "" {
-			touchedRoots[root] = struct{}{}
-		}
-		changed = true
+	changed, errPatch := applyAuthFileFieldsPatch(targetAuth, req)
+	if errPatch != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errPatch.Error()})
+		return
 	}
-	if changed {
-		syncAuthFileMetadataFields(targetAuth, touchedRoots)
-	}
-
 	if !changed {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "no fields to update"})
 		return
@@ -1732,6 +1745,316 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+// PatchAuthFileFieldsBatch updates the same metadata fields on multiple auth files.
+func (h *Handler) PatchAuthFileFieldsBatch(c *gin.Context) {
+	if h.authManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
+		return
+	}
+
+	var req map[string]json.RawMessage
+	decoder := json.NewDecoder(c.Request.Body)
+	decoder.UseNumber()
+	if err := decoder.Decode(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+
+	namesRaw, ok := req["names"]
+	if !ok {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "names are required"})
+		return
+	}
+	var requestedNames []string
+	if err := json.Unmarshal(namesRaw, &requestedNames); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "names are required"})
+		return
+	}
+	names := normalizeAuthFileBatchNames(requestedNames)
+	if len(names) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "names are required"})
+		return
+	}
+
+	fieldsRaw, ok := req["fields"]
+	if !ok {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "fields are required"})
+		return
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(fieldsRaw, &fields); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "fields must be an object"})
+		return
+	}
+	if len(fields) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "no fields to update"})
+		return
+	}
+
+	job := &authFieldsJob{
+		ID:        uuid.NewString(),
+		Status:    "running",
+		StartedAt: time.Now(),
+	}
+
+	if !h.beginAuthFieldsJob(job) {
+		c.JSON(http.StatusConflict, gin.H{"error": "auth fields job already in progress"})
+		return
+	}
+
+	go h.runAuthFieldsJob(context.Background(), job.ID, append([]string(nil), names...), cloneRawMessageMap(fields))
+
+	c.JSON(http.StatusAccepted, gin.H{
+		"status": "accepted",
+		"job_id": job.ID,
+		"job":    h.authFieldsJobSnapshot(job.ID),
+	})
+}
+
+// GetAuthFileFieldsBatchJob returns progress for a bulk auth-file fields update job.
+func (h *Handler) GetAuthFileFieldsBatchJob(c *gin.Context) {
+	if h == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "handler unavailable"})
+		return
+	}
+	id := strings.TrimSpace(c.Param("id"))
+	if id == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "job id is required"})
+		return
+	}
+	job := h.authFieldsJobSnapshot(id)
+	if job == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "auth fields job not found"})
+		return
+	}
+	c.JSON(http.StatusOK, job)
+}
+
+func cloneRawMessageMap(fields map[string]json.RawMessage) map[string]json.RawMessage {
+	out := make(map[string]json.RawMessage, len(fields))
+	for key, raw := range fields {
+		out[key] = append(json.RawMessage(nil), raw...)
+	}
+	return out
+}
+
+func (h *Handler) beginAuthFieldsJob(job *authFieldsJob) bool {
+	if h == nil || job == nil || strings.TrimSpace(job.ID) == "" {
+		return false
+	}
+	h.fieldJobsMu.Lock()
+	defer h.fieldJobsMu.Unlock()
+	if h.fieldJobRunning {
+		return false
+	}
+	if h.fieldJobs == nil {
+		h.fieldJobs = make(map[string]*authFieldsJob)
+	}
+	h.pruneAuthFieldsJobsLocked(time.Now())
+	h.fieldJobs[job.ID] = job
+	h.fieldJobRunning = true
+	return true
+}
+
+func (h *Handler) finishAuthFieldsJob(id, status string) {
+	if h == nil || strings.TrimSpace(id) == "" {
+		return
+	}
+	if strings.TrimSpace(status) == "" {
+		status = "completed"
+	}
+	h.fieldJobsMu.Lock()
+	defer h.fieldJobsMu.Unlock()
+	if job := h.fieldJobs[id]; job != nil {
+		job.Status = status
+		job.FinishedAt = time.Now()
+	}
+	h.fieldJobRunning = false
+}
+
+func (h *Handler) updateAuthFieldsJob(id string, fn func(*authFieldsJob)) {
+	if h == nil || strings.TrimSpace(id) == "" || fn == nil {
+		return
+	}
+	h.fieldJobsMu.Lock()
+	defer h.fieldJobsMu.Unlock()
+	if job := h.fieldJobs[id]; job != nil {
+		fn(job)
+	}
+}
+
+func (h *Handler) authFieldsJobSnapshot(id string) *authFieldsJob {
+	if h == nil || strings.TrimSpace(id) == "" {
+		return nil
+	}
+	h.fieldJobsMu.Lock()
+	defer h.fieldJobsMu.Unlock()
+	job := h.fieldJobs[id]
+	if job == nil {
+		return nil
+	}
+	copyJob := *job
+	if len(job.Files) > 0 {
+		copyJob.Files = append([]string(nil), job.Files...)
+	}
+	if len(job.Failures) > 0 {
+		copyJob.Failures = append([]authFieldsJobFailure(nil), job.Failures...)
+	}
+	return &copyJob
+}
+
+func (h *Handler) pruneAuthFieldsJobsLocked(now time.Time) {
+	if h == nil || len(h.fieldJobs) == 0 {
+		return
+	}
+	const maxAge = 6 * time.Hour
+	for id, job := range h.fieldJobs {
+		if job == nil {
+			delete(h.fieldJobs, id)
+			continue
+		}
+		if !job.FinishedAt.IsZero() && now.Sub(job.FinishedAt) > maxAge {
+			delete(h.fieldJobs, id)
+		}
+	}
+}
+
+func (h *Handler) runAuthFieldsJob(ctx context.Context, jobID string, names []string, fields map[string]json.RawMessage) {
+	status := "completed"
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			status = "failed"
+			h.updateAuthFieldsJob(jobID, func(job *authFieldsJob) {
+				job.Failures = append(job.Failures, authFieldsJobFailure{
+					Name:  "batch-fields",
+					Error: fmt.Sprintf("panic: %v", recovered),
+				})
+				job.Failed++
+			})
+		}
+		h.finishAuthFieldsJob(jobID, status)
+	}()
+
+	h.updateAuthFieldsJob(jobID, func(job *authFieldsJob) {
+		job.Total = len(names)
+	})
+
+	for _, name := range names {
+		targetAuth := h.findAuthFileForFieldsPatch(name)
+		if targetAuth == nil {
+			h.updateAuthFieldsJob(jobID, func(job *authFieldsJob) {
+				job.Failed++
+				job.Failures = append(job.Failures, authFieldsJobFailure{Name: name, Error: "auth file not found"})
+			})
+			continue
+		}
+
+		changed, errPatch := applyAuthFileFieldsPatch(targetAuth, fields)
+		if errPatch != nil {
+			h.updateAuthFieldsJob(jobID, func(job *authFieldsJob) {
+				job.Failed++
+				job.Failures = append(job.Failures, authFieldsJobFailure{Name: name, Error: errPatch.Error()})
+			})
+			continue
+		}
+		if !changed {
+			h.updateAuthFieldsJob(jobID, func(job *authFieldsJob) {
+				job.Failed++
+				job.Failures = append(job.Failures, authFieldsJobFailure{Name: name, Error: "no fields to update"})
+			})
+			continue
+		}
+
+		targetAuth.UpdatedAt = time.Now()
+		if _, err := h.authManager.Update(ctx, targetAuth); err != nil {
+			h.updateAuthFieldsJob(jobID, func(job *authFieldsJob) {
+				job.Failed++
+				job.Failures = append(job.Failures, authFieldsJobFailure{Name: name, Error: fmt.Sprintf("failed to update auth: %v", err)})
+			})
+			continue
+		}
+		h.updateAuthFieldsJob(jobID, func(job *authFieldsJob) {
+			job.Updated++
+			job.Files = append(job.Files, name)
+		})
+	}
+	if snapshot := h.authFieldsJobSnapshot(jobID); snapshot != nil && snapshot.Failed > 0 {
+		if snapshot.Updated == 0 {
+			status = "failed"
+		} else {
+			status = "partial"
+		}
+	}
+}
+
+func (h *Handler) findAuthFileForFieldsPatch(name string) *coreauth.Auth {
+	if h == nil || h.authManager == nil {
+		return nil
+	}
+	if auth, ok := h.authManager.GetByID(name); ok {
+		return auth
+	}
+	auths := h.authManager.List()
+	for _, auth := range auths {
+		if auth.FileName == name {
+			return auth
+		}
+	}
+	return nil
+}
+
+func normalizeAuthFileBatchNames(names []string) []string {
+	seen := make(map[string]struct{}, len(names))
+	normalized := make([]string, 0, len(names))
+	for _, name := range names {
+		trimmed := strings.TrimSpace(name)
+		if trimmed == "" {
+			continue
+		}
+		if _, ok := seen[trimmed]; ok {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		normalized = append(normalized, trimmed)
+	}
+	return normalized
+}
+
+func applyAuthFileFieldsPatch(targetAuth *coreauth.Auth, fields map[string]json.RawMessage) (bool, error) {
+	if targetAuth == nil {
+		return false, fmt.Errorf("auth file not found")
+	}
+	changed := false
+	touchedRoots := make(map[string]struct{}, len(fields))
+	for key, rawValue := range fields {
+		fieldPath := strings.TrimSpace(key)
+		if fieldPath == "" {
+			return false, fmt.Errorf("field name is required")
+		}
+		value, errDecode := decodeAuthFileFieldValue(rawValue)
+		if errDecode != nil {
+			return false, fmt.Errorf("invalid field %s", fieldPath)
+		}
+		if targetAuth.Metadata == nil {
+			targetAuth.Metadata = make(map[string]any)
+		}
+
+		if fieldPath == "headers" {
+			applyAuthFileHeadersPatch(targetAuth, value)
+		} else if errSet := setAuthFileMetadataValue(targetAuth.Metadata, fieldPath, value); errSet != nil {
+			return false, errSet
+		}
+		if root := rootAuthFileField(fieldPath); root != "" {
+			touchedRoots[root] = struct{}{}
+		}
+		changed = true
+	}
+	if changed {
+		syncAuthFileMetadataFields(targetAuth, touchedRoots)
+	}
+	return changed, nil
 }
 
 func decodeAuthFileFieldValue(raw json.RawMessage) (any, error) {

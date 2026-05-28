@@ -49,6 +49,9 @@ type Handler struct {
 	refreshJobsMu       sync.Mutex
 	refreshJobs         map[string]*authRefreshJob
 	refreshJobRunning   bool
+	fieldJobsMu         sync.Mutex
+	fieldJobs           map[string]*authFieldsJob
+	fieldJobRunning     bool
 }
 
 // NewHandler creates a new management handler instance.
@@ -65,6 +68,7 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 		allowRemoteOverride: envSecret != "",
 		envSecret:           envSecret,
 		refreshJobs:         make(map[string]*authRefreshJob),
+		fieldJobs:           make(map[string]*authFieldsJob),
 	}
 	h.startAttemptCleanup()
 	return h

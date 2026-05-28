@@ -700,6 +700,8 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PATCH("/auth-files/refresh-token-lock", s.mgmt.PatchAuthFileRefreshTokenLock)
 		mgmt.DELETE("/auth-files", s.mgmt.DeleteAuthFile)
 		mgmt.PATCH("/auth-files/status", s.mgmt.PatchAuthFileStatus)
+		mgmt.PATCH("/auth-files/fields/batch", s.mgmt.PatchAuthFileFieldsBatch)
+		mgmt.GET("/auth-files/fields/batch/jobs/:id", s.mgmt.GetAuthFileFieldsBatchJob)
 		mgmt.PATCH("/auth-files/fields", s.mgmt.PatchAuthFileFields)
 		mgmt.POST("/vertex/import", s.mgmt.ImportVertexCredential)
 

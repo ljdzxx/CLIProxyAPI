@@ -92,3 +92,73 @@ func TestListAuthFiles_IncludesRecentRequestsBuckets(t *testing.T) {
 		}
 	}
 }
+
+func TestListAuthFilesExposesLastErrorHTTPStatus(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	record := &coreauth.Auth{
+		ID:       "err-auth",
+		Provider: "codex",
+		Attributes: map[string]string{
+			"runtime_only": "true",
+		},
+		Metadata: map[string]any{
+			"type": "codex",
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+	manager.MarkResult(context.Background(), coreauth.Result{
+		AuthID:   "err-auth",
+		Provider: "codex",
+		Model:    "gpt-5",
+		Success:  false,
+		Error: &coreauth.Error{
+			Code:       "quota",
+			Message:    "quota exhausted",
+			HTTPStatus: http.StatusTooManyRequests,
+		},
+	})
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	h.tokenStore = &memoryAuthStore{}
+
+	rec := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(rec)
+	ginCtx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/auth-files", nil)
+	h.ListAuthFiles(ginCtx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected list status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	var payload map[string]any
+	if errUnmarshal := json.Unmarshal(rec.Body.Bytes(), &payload); errUnmarshal != nil {
+		t.Fatalf("failed to decode list payload: %v", errUnmarshal)
+	}
+	filesRaw, ok := payload["files"].([]any)
+	if !ok || len(filesRaw) != 1 {
+		t.Fatalf("expected one file entry, payload: %#v", payload)
+	}
+	fileEntry, ok := filesRaw[0].(map[string]any)
+	if !ok {
+		t.Fatalf("expected file entry object, got %#v", filesRaw[0])
+	}
+
+	if got, _ := fileEntry["last_error_http_status"].(float64); int(got) != http.StatusTooManyRequests {
+		t.Fatalf("last_error_http_status = %#v, want %d", fileEntry["last_error_http_status"], http.StatusTooManyRequests)
+	}
+	lastError, ok := fileEntry["last_error"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected last_error object, got %#v", fileEntry["last_error"])
+	}
+	if got, _ := lastError["http_status"].(float64); int(got) != http.StatusTooManyRequests {
+		t.Fatalf("last_error.http_status = %#v, want %d", lastError["http_status"], http.StatusTooManyRequests)
+	}
+	if got, _ := lastError["message"].(string); got != "quota exhausted" {
+		t.Fatalf("last_error.message = %q, want quota exhausted", got)
+	}
+}

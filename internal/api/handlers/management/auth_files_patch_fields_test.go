@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -278,5 +279,126 @@ func TestPatchAuthFileFields_ArbitraryFieldsPersistToFile(t *testing.T) {
 	}
 	if got := fgh["ijk"]; got != true {
 		t.Fatalf("fgh.ijk = %#v, want true", got)
+	}
+}
+
+func TestPatchAuthFileFieldsBatch_MergeHeadersAndPartialFailure(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	records := []*coreauth.Auth{
+		{
+			ID:       "one.json",
+			FileName: "one.json",
+			Provider: "claude",
+			Attributes: map[string]string{
+				"path":            "/tmp/one.json",
+				"header:X-Old":    "old",
+				"header:X-Remove": "gone",
+			},
+			Metadata: map[string]any{
+				"type": "claude",
+				"headers": map[string]any{
+					"X-Old":    "old",
+					"X-Remove": "gone",
+				},
+			},
+		},
+		{
+			ID:       "two.json",
+			FileName: "two.json",
+			Provider: "codex",
+			Attributes: map[string]string{
+				"path":         "/tmp/two.json",
+				"header:X-Old": "old2",
+			},
+			Metadata: map[string]any{
+				"type": "codex",
+				"headers": map[string]any{
+					"X-Old": "old2",
+				},
+			},
+		},
+	}
+	for _, record := range records {
+		if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+			t.Fatalf("failed to register auth record: %v", errRegister)
+		}
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+
+	body := `{"names":["one.json","missing.json","two.json","one.json"],"fields":{"proxy_url":"http://proxy.local","priority":7,"headers":{"X-Old":"new","X-New":"v","X-Remove":""}}}`
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields/batch", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	h.PatchAuthFileFieldsBatch(ctx)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusAccepted, rec.Code, rec.Body.String())
+	}
+
+	var payload struct {
+		Status string `json:"status"`
+		JobID  string `json:"job_id"`
+	}
+	if errDecode := json.Unmarshal(rec.Body.Bytes(), &payload); errDecode != nil {
+		t.Fatalf("failed to decode response: %v", errDecode)
+	}
+	if payload.Status != "accepted" {
+		t.Fatalf("status = %q, want accepted", payload.Status)
+	}
+	if payload.JobID == "" {
+		t.Fatalf("expected job_id in response")
+	}
+
+	var job *authFieldsJob
+	for i := 0; i < 100; i++ {
+		job = h.authFieldsJobSnapshot(payload.JobID)
+		if job != nil && job.Status != "running" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if job == nil {
+		t.Fatalf("expected job snapshot")
+	}
+	if job.Status != "partial" {
+		t.Fatalf("job status = %q, want partial", job.Status)
+	}
+	if job.Updated != 2 {
+		t.Fatalf("job updated = %d, want 2", job.Updated)
+	}
+	if len(job.Files) != 2 || job.Files[0] != "one.json" || job.Files[1] != "two.json" {
+		t.Fatalf("job files = %#v, want one.json and two.json", job.Files)
+	}
+	if len(job.Failures) != 1 || job.Failures[0].Name != "missing.json" {
+		t.Fatalf("job failures = %#v, want missing.json failure", job.Failures)
+	}
+
+	for _, name := range []string{"one.json", "two.json"} {
+		updated, ok := manager.GetByID(name)
+		if !ok || updated == nil {
+			t.Fatalf("expected auth %s to exist after patch", name)
+		}
+		if updated.ProxyURL != "http://proxy.local" {
+			t.Fatalf("%s proxy_url = %q, want http://proxy.local", name, updated.ProxyURL)
+		}
+		if got := updated.Attributes["priority"]; got != "7" {
+			t.Fatalf("%s priority attr = %q, want 7", name, got)
+		}
+		if got := updated.Attributes["header:X-Old"]; got != "new" {
+			t.Fatalf("%s header:X-Old = %q, want new", name, got)
+		}
+		if got := updated.Attributes["header:X-New"]; got != "v" {
+			t.Fatalf("%s header:X-New = %q, want v", name, got)
+		}
+		if _, ok := updated.Attributes["header:X-Remove"]; ok {
+			t.Fatalf("%s header:X-Remove should be deleted", name)
+		}
 	}
 }

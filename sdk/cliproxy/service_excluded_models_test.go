@@ -132,3 +132,64 @@ func TestRegisterModelsForAuth_OpenAICompatibilityImageModelType(t *testing.T) {
 		t.Fatal("expected chat model to keep default thinking support")
 	}
 }
+
+func TestRegisterModelsForAuth_CodexUnknownPlanDefaultsToFreeModels(t *testing.T) {
+	service := &Service{cfg: &config.Config{}}
+	auth := &coreauth.Auth{
+		ID:       "codex-unknown-plan-test",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+	}
+
+	modelRegistry := internalregistry.GetGlobalRegistry()
+	modelRegistry.UnregisterClient(auth.ID)
+	t.Cleanup(func() {
+		modelRegistry.UnregisterClient(auth.ID)
+	})
+
+	service.registerModelsForAuth(auth)
+
+	models := modelRegistry.GetModelsForClient(auth.ID)
+	if hasModelID(models, "gpt-5.4") {
+		t.Fatal("expected unknown Codex plan to avoid registering gpt-5.4")
+	}
+	if !hasModelID(models, "gpt-5.4-mini") {
+		t.Fatal("expected unknown Codex plan to register free-tier gpt-5.4-mini")
+	}
+}
+
+func TestRegisterModelsForAuth_CodexPlanFallsBackToMetadata(t *testing.T) {
+	service := &Service{cfg: &config.Config{}}
+	auth := &coreauth.Auth{
+		ID:       "codex-metadata-plan-test",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Metadata: map[string]any{
+			"plan_type": "plus",
+		},
+	}
+
+	modelRegistry := internalregistry.GetGlobalRegistry()
+	modelRegistry.UnregisterClient(auth.ID)
+	t.Cleanup(func() {
+		modelRegistry.UnregisterClient(auth.ID)
+	})
+
+	service.registerModelsForAuth(auth)
+
+	if !hasModelID(modelRegistry.GetModelsForClient(auth.ID), "gpt-5.4") {
+		t.Fatal("expected Codex plan_type from metadata to register plus-tier gpt-5.4")
+	}
+}
+
+func hasModelID(models []*internalregistry.ModelInfo, id string) bool {
+	for _, model := range models {
+		if model == nil {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(model.ID), id) {
+			return true
+		}
+	}
+	return false
+}

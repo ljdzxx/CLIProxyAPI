@@ -216,6 +216,126 @@ func TestPatchAuthFileFields_WebsocketsFalseIsUpdate(t *testing.T) {
 	}
 }
 
+func TestPatchAuthFileFields_ExcludedModelsUpdatesRuntimeAttributes(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{
+		ID:       "codex-excluded.json",
+		FileName: "codex-excluded.json",
+		Provider: "codex",
+		Attributes: map[string]string{
+			"path": "/tmp/codex-excluded.json",
+		},
+		Metadata: map[string]any{
+			"type": "codex",
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+
+	body := `{"name":"codex-excluded.json","excluded_models":[" GPT-5.4 ","gpt-5.4","o4-mini"]}`
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	h.PatchAuthFileFields(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	updated, ok := manager.GetByID("codex-excluded.json")
+	if !ok || updated == nil {
+		t.Fatalf("expected auth record to exist after patch")
+	}
+	if got := updated.Attributes["excluded_models"]; got != "gpt-5.4,o4-mini" {
+		t.Fatalf("attrs excluded_models = %q, want gpt-5.4,o4-mini", got)
+	}
+	if got := updated.Attributes["excluded_models_hash"]; got == "" {
+		t.Fatalf("expected excluded_models_hash to be set")
+	}
+
+	body = `{"name":"codex-excluded.json","excluded_models":[]}`
+	rec = httptest.NewRecorder()
+	ctx, _ = gin.CreateTestContext(rec)
+	req = httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	h.PatchAuthFileFields(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected clear status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	updated, ok = manager.GetByID("codex-excluded.json")
+	if !ok || updated == nil {
+		t.Fatalf("expected auth record to exist after clear")
+	}
+	if _, ok := updated.Attributes["excluded_models"]; ok {
+		t.Fatalf("expected excluded_models attr to be deleted")
+	}
+	if _, ok := updated.Attributes["excluded_models_hash"]; ok {
+		t.Fatalf("expected excluded_models_hash attr to be deleted")
+	}
+}
+
+func TestPatchAuthFileFields_ExcludedModelsPreservesGlobalOAuthExclusions(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{
+		ID:       "codex-global.json",
+		FileName: "codex-global.json",
+		Provider: "codex",
+		Attributes: map[string]string{
+			"path":      "/tmp/codex-global.json",
+			"auth_kind": "oauth",
+		},
+		Metadata: map[string]any{
+			"type": "codex",
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{
+		AuthDir: t.TempDir(),
+		OAuthExcludedModels: map[string][]string{
+			"codex": {"gpt-5.4"},
+		},
+	}, manager)
+
+	body := `{"name":"codex-global.json","excluded_models":["o4-mini"]}`
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	req := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ctx.Request = req
+	h.PatchAuthFileFields(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	updated, ok := manager.GetByID("codex-global.json")
+	if !ok || updated == nil {
+		t.Fatalf("expected auth record to exist after patch")
+	}
+	if got := updated.Attributes["excluded_models"]; got != "gpt-5.4,o4-mini" {
+		t.Fatalf("attrs excluded_models = %q, want gpt-5.4,o4-mini", got)
+	}
+}
+
 func TestPatchAuthFileFields_ArbitraryFieldsPersistToFile(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 	gin.SetMode(gin.TestMode)

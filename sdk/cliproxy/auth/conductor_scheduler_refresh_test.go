@@ -215,3 +215,76 @@ func TestManager_PickNext_RebuildsSchedulerAfterModelCooldownError(t *testing.T)
 		t.Fatalf("pickNext() auth = %v, want %q", got, newAuth.ID)
 	}
 }
+
+func TestManager_ReconcileRegistryModelStates_PreservesModelSupportCooldown(t *testing.T) {
+	ctx := context.Background()
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+
+	auth := &Auth{
+		ID:       "codex-model-support-cooldown",
+		Provider: "codex",
+	}
+	if _, errRegister := manager.Register(ctx, auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	model := "gpt-5.4"
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth.ID, "codex", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(auth.ID)
+	})
+
+	manager.MarkResult(ctx, Result{
+		AuthID:   auth.ID,
+		Provider: "codex",
+		Model:    model,
+		Success:  false,
+		Error: &Error{
+			HTTPStatus: http.StatusForbidden,
+			Message:    "The 'gpt-5.4' model is not supported when using Codex with a ChatGPT account.",
+		},
+	})
+
+	before, ok := manager.GetByID(auth.ID)
+	if !ok || before == nil {
+		t.Fatalf("expected auth to be present")
+	}
+	beforeState := before.ModelStates[model]
+	if beforeState == nil || !beforeState.Unavailable || beforeState.NextRetryAfter.IsZero() {
+		t.Fatalf("expected model support cooldown before reconcile, got %#v", beforeState)
+	}
+
+	// Simulate a model catalog refresh rebinding the same model. The account-level
+	// upstream rejection must remain in effect even though the static catalog still
+	// lists this model for the auth.
+	reg.RegisterClient(auth.ID, "codex", []*registry.ModelInfo{{ID: model}})
+	manager.ReconcileRegistryModelStates(ctx, auth.ID)
+	manager.RefreshSchedulerEntry(auth.ID)
+
+	after, ok := manager.GetByID(auth.ID)
+	if !ok || after == nil {
+		t.Fatalf("expected auth to remain present")
+	}
+	afterState := after.ModelStates[model]
+	if afterState == nil {
+		t.Fatalf("expected model state for %q to survive reconcile", model)
+	}
+	if !afterState.Unavailable {
+		t.Fatalf("expected model support cooldown to remain unavailable")
+	}
+	if afterState.NextRetryAfter.IsZero() {
+		t.Fatalf("expected model support cooldown retry time to survive reconcile")
+	}
+	if afterState.NextRetryAfter.Before(beforeState.NextRetryAfter.Add(-time.Second)) {
+		t.Fatalf("expected retry time to be preserved, before=%v after=%v", beforeState.NextRetryAfter, afterState.NextRetryAfter)
+	}
+
+	got, errPick := manager.scheduler.pickSingle(ctx, "codex", model, cliproxyexecutor.Options{}, nil)
+	if errPick == nil {
+		t.Fatalf("expected scheduler to keep auth blocked for unsupported model, got auth=%v", got)
+	}
+	if got != nil {
+		t.Fatalf("expected no auth while unsupported model cooldown is active, got %v", got)
+	}
+}

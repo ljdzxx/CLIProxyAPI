@@ -1131,10 +1131,7 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 		}
 		models = applyExcludedModels(models, excluded)
 	case "codex":
-		codexPlanType := ""
-		if a.Attributes != nil {
-			codexPlanType = strings.TrimSpace(a.Attributes["plan_type"])
-		}
+		codexPlanType := codexPlanTypeForAuth(a)
 		switch strings.ToLower(codexPlanType) {
 		case "pro":
 			models = registry.GetCodexProModels()
@@ -1145,7 +1142,7 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 		case "free":
 			models = registry.GetCodexFreeModels()
 		default:
-			models = registry.GetCodexProModels()
+			models = registry.GetCodexFreeModels()
 		}
 		if entry := s.resolveConfigCodexKey(a); entry != nil {
 			if len(entry.Models) > 0 {
@@ -1240,6 +1237,23 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 	}
 
 	GlobalModelRegistry().UnregisterClient(a.ID)
+}
+
+func codexPlanTypeForAuth(a *coreauth.Auth) string {
+	if a == nil {
+		return ""
+	}
+	if a.Attributes != nil {
+		if planType := strings.TrimSpace(a.Attributes["plan_type"]); planType != "" {
+			return planType
+		}
+	}
+	if a.Metadata != nil {
+		if planType, ok := a.Metadata["plan_type"].(string); ok {
+			return strings.TrimSpace(planType)
+		}
+	}
+	return ""
 }
 
 // refreshModelRegistrationForAuth re-applies the latest model registration for

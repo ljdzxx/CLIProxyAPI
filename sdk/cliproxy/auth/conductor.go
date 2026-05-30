@@ -289,8 +289,10 @@ func (m *Manager) RefreshSchedulerEntry(authID string) {
 // registry snapshot for one auth.
 //
 // Supported models are reset to a clean state because re-registration already
-// cleared the registry-side cooldown/suspension snapshot. ModelStates for
-// models that are no longer present in the registry are pruned entirely so
+// cleared the registry-side cooldown/suspension snapshot. Account/model support
+// failures are preserved until their retry time so catalog refreshes cannot
+// immediately re-enable a model the upstream account just rejected. ModelStates
+// for models that are no longer present in the registry are pruned entirely so
 // renamed/removed models cannot keep auth-level status stale.
 func (m *Manager) ReconcileRegistryModelStates(ctx context.Context, authID string) {
 	if m == nil || authID == "" {
@@ -334,6 +336,9 @@ func (m *Manager) ReconcileRegistryModelStates(ctx context.Context, authID strin
 				continue
 			}
 			if modelStateIsClean(state) {
+				continue
+			}
+			if modelStateIsModelSupportError(state) && state.Unavailable && state.NextRetryAfter.After(now) {
 				continue
 			}
 			resetModelState(state, now)
@@ -2478,6 +2483,19 @@ func modelStateIsClean(state *ModelState) bool {
 	return true
 }
 
+func modelStateIsModelSupportError(state *ModelState) bool {
+	if state == nil {
+		return false
+	}
+	if isModelSupportResultError(state.LastError) {
+		return true
+	}
+	if state.LastError == nil || state.LastError.StatusCode() == 0 {
+		return isModelSupportErrorMessage(state.StatusMessage)
+	}
+	return false
+}
+
 func updateAggregatedAvailability(auth *Auth, now time.Time) {
 	if auth == nil {
 		return
@@ -2701,6 +2719,7 @@ func isModelSupportErrorMessage(message string) bool {
 		"model not supported",
 		"unsupported model",
 		"model unavailable",
+		"not supported when using codex with a chatgpt account",
 		"not available for your plan",
 		"not available for your account",
 	}
@@ -2717,7 +2736,7 @@ func isModelSupportError(err error) bool {
 		return false
 	}
 	status := statusCodeFromError(err)
-	if status != http.StatusBadRequest && status != http.StatusUnprocessableEntity {
+	if !isModelSupportStatus(status) {
 		return false
 	}
 	return isModelSupportErrorMessage(err.Error())
@@ -2728,10 +2747,19 @@ func isModelSupportResultError(err *Error) bool {
 		return false
 	}
 	status := statusCodeFromResult(err)
-	if status != http.StatusBadRequest && status != http.StatusUnprocessableEntity {
+	if !isModelSupportStatus(status) {
 		return false
 	}
 	return isModelSupportErrorMessage(err.Message)
+}
+
+func isModelSupportStatus(status int) bool {
+	switch status {
+	case http.StatusBadRequest, http.StatusForbidden, http.StatusUnprocessableEntity:
+		return true
+	default:
+		return false
+	}
 }
 
 func isRequestScopedNotFoundMessage(message string) bool {

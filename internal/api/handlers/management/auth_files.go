@@ -33,6 +33,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/diff"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
@@ -1727,7 +1728,7 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 		return
 	}
 
-	changed, errPatch := applyAuthFileFieldsPatch(targetAuth, req)
+	changed, errPatch := h.applyAuthFileFieldsPatch(targetAuth, req)
 	if errPatch != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errPatch.Error()})
 		return
@@ -1951,7 +1952,7 @@ func (h *Handler) runAuthFieldsJob(ctx context.Context, jobID string, names []st
 			continue
 		}
 
-		changed, errPatch := applyAuthFileFieldsPatch(targetAuth, fields)
+		changed, errPatch := h.applyAuthFileFieldsPatch(targetAuth, fields)
 		if errPatch != nil {
 			h.updateAuthFieldsJob(jobID, func(job *authFieldsJob) {
 				job.Failed++
@@ -2022,7 +2023,7 @@ func normalizeAuthFileBatchNames(names []string) []string {
 	return normalized
 }
 
-func applyAuthFileFieldsPatch(targetAuth *coreauth.Auth, fields map[string]json.RawMessage) (bool, error) {
+func (h *Handler) applyAuthFileFieldsPatch(targetAuth *coreauth.Auth, fields map[string]json.RawMessage) (bool, error) {
 	if targetAuth == nil {
 		return false, fmt.Errorf("auth file not found")
 	}
@@ -2052,7 +2053,7 @@ func applyAuthFileFieldsPatch(targetAuth *coreauth.Auth, fields map[string]json.
 		changed = true
 	}
 	if changed {
-		syncAuthFileMetadataFields(targetAuth, touchedRoots)
+		h.syncAuthFileMetadataFields(targetAuth, touchedRoots)
 	}
 	return changed, nil
 }
@@ -2164,7 +2165,7 @@ func authFileHeadersStringMap(value any) (map[string]string, bool) {
 	}
 }
 
-func syncAuthFileMetadataFields(auth *coreauth.Auth, touchedRoots map[string]struct{}) {
+func (h *Handler) syncAuthFileMetadataFields(auth *coreauth.Auth, touchedRoots map[string]struct{}) {
 	if auth == nil || len(touchedRoots) == 0 {
 		return
 	}
@@ -2189,6 +2190,12 @@ func syncAuthFileMetadataFields(auth *coreauth.Auth, touchedRoots map[string]str
 	}
 	if _, ok := touchedRoots["websockets"]; ok {
 		syncAuthFileWebsocketsAttribute(auth)
+	}
+	if _, ok := touchedRoots["excluded_models"]; ok {
+		h.syncAuthFileExcludedModelsAttribute(auth)
+	}
+	if _, ok := touchedRoots["excluded-models"]; ok {
+		h.syncAuthFileExcludedModelsAttribute(auth)
 	}
 	if _, ok := touchedRoots["disabled"]; ok {
 		syncAuthFileDisabledState(auth)
@@ -2297,6 +2304,74 @@ func authFileBoolValue(value any) (bool, bool) {
 		}
 	}
 	return false, false
+}
+
+func (h *Handler) syncAuthFileExcludedModelsAttribute(auth *coreauth.Auth) {
+	if auth == nil {
+		return
+	}
+	if auth.Attributes == nil {
+		auth.Attributes = make(map[string]string)
+	}
+	models := normalizeAuthFileExcludedModels(auth.Metadata["excluded_models"])
+	if len(models) == 0 && auth.Metadata != nil {
+		models = normalizeAuthFileExcludedModels(auth.Metadata["excluded-models"])
+	}
+	if h != nil && h.cfg != nil {
+		authKind := strings.ToLower(strings.TrimSpace(auth.Attributes["auth_kind"]))
+		if authKind == "" {
+			if kind, _ := auth.AccountInfo(); strings.EqualFold(kind, "api_key") {
+				authKind = "apikey"
+			}
+		}
+		if authKind != "apikey" {
+			providerKey := strings.ToLower(strings.TrimSpace(auth.Provider))
+			models = append(models, h.cfg.OAuthExcludedModels[providerKey]...)
+		}
+	}
+	models = normalizeAuthFileExcludedModelsList(models)
+	if len(models) == 0 {
+		delete(auth.Attributes, "excluded_models")
+		delete(auth.Attributes, "excluded_models_hash")
+		return
+	}
+	auth.Attributes["excluded_models"] = strings.Join(models, ",")
+	auth.Attributes["excluded_models_hash"] = diff.ComputeExcludedModelsHash(models)
+}
+
+func normalizeAuthFileExcludedModels(value any) []string {
+	switch typed := value.(type) {
+	case []string:
+		return normalizeAuthFileExcludedModelsList(typed)
+	case []any:
+		items := make([]string, 0, len(typed))
+		for _, entry := range typed {
+			if text, ok := entry.(string); ok {
+				items = append(items, text)
+			}
+		}
+		return normalizeAuthFileExcludedModelsList(items)
+	default:
+		return nil
+	}
+}
+
+func normalizeAuthFileExcludedModelsList(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		model := strings.ToLower(strings.TrimSpace(value))
+		if model == "" {
+			continue
+		}
+		if _, ok := seen[model]; ok {
+			continue
+		}
+		seen[model] = struct{}{}
+		out = append(out, model)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func syncAuthFileDisabledState(auth *coreauth.Auth) {

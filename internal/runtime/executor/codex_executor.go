@@ -853,7 +853,30 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 	auth.Metadata["type"] = "codex"
 	now := time.Now().Format(time.RFC3339)
 	auth.Metadata["last_refresh"] = now
+	syncCodexPlanTypeFromIDToken(auth, td.IDToken)
 	return auth, nil
+}
+
+func syncCodexPlanTypeFromIDToken(auth *cliproxyauth.Auth, idToken string) {
+	if auth == nil {
+		return
+	}
+	claims, err := codexauth.ParseJWTToken(idToken)
+	if err != nil || claims == nil {
+		return
+	}
+	planType := strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType)
+	if planType == "" {
+		return
+	}
+	if auth.Attributes == nil {
+		auth.Attributes = make(map[string]string)
+	}
+	auth.Attributes["plan_type"] = planType
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	auth.Metadata["plan_type"] = planType
 }
 
 func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Format, url string, req cliproxyexecutor.Request, rawJSON []byte) (*http.Request, error) {

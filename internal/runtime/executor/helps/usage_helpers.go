@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -21,21 +22,37 @@ import (
 )
 
 type UsageReporter struct {
-	provider    string
-	model       string
-	alias       string
-	authID      string
-	authIndex   string
-	authType    string
-	apiKey      string
-	source      string
-	reasoning   string
-	requestedAt time.Time
-	ttftMu      sync.RWMutex
-	ttft        time.Duration
-	ttftStart   time.Time
-	ttftSet     bool
-	once        sync.Once
+	provider     string
+	executorType string
+	model        string
+	alias        string
+	authID       string
+	authIndex    string
+	authType     string
+	apiKey       string
+	source       string
+	reasoning    string
+	serviceTier  string
+	requestedAt  time.Time
+	ttftMu       sync.RWMutex
+	ttft         time.Duration
+	ttftStart    time.Time
+	ttftSet      bool
+	once         sync.Once
+}
+
+type usageExecutor interface {
+	Identifier() string
+}
+
+func NewExecutorUsageReporter(ctx context.Context, executor usageExecutor, model string, auth *cliproxyauth.Auth) *UsageReporter {
+	provider := ""
+	if executor != nil {
+		provider = executor.Identifier()
+	}
+	reporter := NewUsageReporter(ctx, provider, model, auth)
+	reporter.executorType = ExecutorTypeName(executor)
+	return reporter
 }
 
 func NewUsageReporter(ctx context.Context, provider, model string, auth *cliproxyauth.Auth) *UsageReporter {
@@ -53,12 +70,24 @@ func NewUsageReporter(ctx context.Context, provider, model string, auth *cliprox
 		source:      resolveUsageSource(auth, apiKey),
 		authType:    resolveUsageAuthType(auth),
 		reasoning:   usage.ReasoningEffortFromContext(ctx),
+		serviceTier: usage.ServiceTierFromContext(ctx),
 	}
 	if auth != nil {
 		reporter.authID = auth.ID
 		reporter.authIndex = auth.EnsureIndex()
 	}
 	return reporter
+}
+
+func ExecutorTypeName(executor any) string {
+	if executor == nil {
+		return ""
+	}
+	executorType := reflect.TypeOf(executor)
+	for executorType.Kind() == reflect.Pointer {
+		executorType = executorType.Elem()
+	}
+	return strings.TrimSpace(executorType.Name())
 }
 
 func (r *UsageReporter) Publish(ctx context.Context, detail usage.Detail) {
@@ -78,6 +107,7 @@ func (r *UsageReporter) SetTranslatedReasoningEffort(payload []byte, format stri
 		return
 	}
 	r.reasoning = thinking.ExtractTranslatedReasoningEffort(payload, format)
+	r.serviceTier = extractServiceTierFromPayload(payload)
 }
 
 func (r *UsageReporter) TrackHTTPClient(client *http.Client) *http.Client {
@@ -231,6 +261,7 @@ func (r *UsageReporter) buildRecordForModel(model string, detail usage.Detail, f
 	}
 	return usage.Record{
 		Provider:        r.provider,
+		ExecutorType:    r.executorType,
 		Model:           model,
 		Alias:           r.alias,
 		Source:          r.source,
@@ -239,6 +270,7 @@ func (r *UsageReporter) buildRecordForModel(model string, detail usage.Detail, f
 		AuthIndex:       r.authIndex,
 		AuthType:        r.authType,
 		ReasoningEffort: r.reasoning,
+		ServiceTier:     r.serviceTier,
 		RequestedAt:     r.requestedAt,
 		Latency:         r.latency(),
 		TTFT:            r.ttftDuration(),
@@ -246,6 +278,19 @@ func (r *UsageReporter) buildRecordForModel(model string, detail usage.Detail, f
 		Fail:            fail,
 		Detail:          detail,
 	}
+}
+
+func extractServiceTierFromPayload(payload []byte) string {
+	if len(payload) == 0 {
+		return usage.DefaultServiceTier
+	}
+	for _, path := range []string{"service_tier", "request.service_tier", "response.service_tier"} {
+		serviceTier := strings.TrimSpace(gjson.GetBytes(payload, path).String())
+		if serviceTier != "" {
+			return serviceTier
+		}
+	}
+	return usage.DefaultServiceTier
 }
 
 func failFromErrors(errs ...error) usage.Failure {
@@ -527,7 +572,7 @@ func parseClaudeUsageNode(usageNode gjson.Result) usage.Detail {
 	if detail.CachedTokens == 0 {
 		detail.CachedTokens = detail.CacheCreationTokens
 	}
-	detail.TotalTokens = detail.InputTokens + detail.OutputTokens
+	detail.TotalTokens = detail.InputTokens + detail.OutputTokens + detail.CacheReadTokens + detail.CacheCreationTokens
 	return detail
 }
 

@@ -42,6 +42,10 @@ func (p *usageQueuePlugin) HandleUsage(ctx context.Context, record coreusage.Rec
 	if provider == "" {
 		provider = "unknown"
 	}
+	executorType := strings.TrimSpace(record.ExecutorType)
+	if executorType == "" {
+		executorType = "unknown"
+	}
 	authType := strings.TrimSpace(record.AuthType)
 	if authType == "" {
 		authType = "unknown"
@@ -51,6 +55,10 @@ func (p *usageQueuePlugin) HandleUsage(ctx context.Context, record coreusage.Rec
 	reasoningEffort := strings.TrimSpace(record.ReasoningEffort)
 	if reasoningEffort == "" {
 		reasoningEffort = coreusage.ReasoningEffortFromContext(ctx)
+	}
+	serviceTier := strings.TrimSpace(record.ServiceTier)
+	if serviceTier == "" {
+		serviceTier = coreusage.ServiceTierFromContext(ctx)
 	}
 
 	tokens := tokenStats{
@@ -90,6 +98,7 @@ func (p *usageQueuePlugin) HandleUsage(ctx context.Context, record coreusage.Rec
 	payload, err := json.Marshal(queuedUsageDetail{
 		requestDetail:   detail,
 		Provider:        provider,
+		ExecutorType:    executorType,
 		Model:           modelName,
 		Alias:           aliasName,
 		Endpoint:        resolveEndpoint(ctx),
@@ -97,6 +106,7 @@ func (p *usageQueuePlugin) HandleUsage(ctx context.Context, record coreusage.Rec
 		APIKey:          apiKey,
 		RequestID:       requestID,
 		ReasoningEffort: reasoningEffort,
+		ServiceTier:     serviceTier,
 	})
 	if err != nil {
 		return
@@ -107,6 +117,7 @@ func (p *usageQueuePlugin) HandleUsage(ctx context.Context, record coreusage.Rec
 type queuedUsageDetail struct {
 	requestDetail
 	Provider        string `json:"provider"`
+	ExecutorType    string `json:"executor_type"`
 	Model           string `json:"model"`
 	Alias           string `json:"alias"`
 	Endpoint        string `json:"endpoint"`
@@ -114,6 +125,7 @@ type queuedUsageDetail struct {
 	APIKey          string `json:"api_key"`
 	RequestID       string `json:"request_id"`
 	ReasoningEffort string `json:"reasoning_effort"`
+	ServiceTier     string `json:"service_tier"`
 }
 
 type requestDetail struct {

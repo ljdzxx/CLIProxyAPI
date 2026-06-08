@@ -1834,11 +1834,106 @@ func (h *Handler) GetAuthFileFieldsBatchJob(c *gin.Context) {
 }
 
 func cloneRawMessageMap(fields map[string]json.RawMessage) map[string]json.RawMessage {
+	if len(fields) == 0 {
+		return nil
+	}
 	out := make(map[string]json.RawMessage, len(fields))
 	for key, raw := range fields {
 		out[key] = append(json.RawMessage(nil), raw...)
 	}
 	return out
+}
+
+func (h *Handler) parseCodexAuthPreset(c *gin.Context) (map[string]json.RawMessage, bool) {
+	if c == nil || c.Request == nil || c.Request.Body == nil {
+		return nil, true
+	}
+
+	var req map[string]json.RawMessage
+	decoder := json.NewDecoder(c.Request.Body)
+	decoder.UseNumber()
+	if err := decoder.Decode(&req); err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil, true
+		}
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return nil, false
+	}
+	if len(req) == 0 {
+		return nil, true
+	}
+
+	normalized := make(map[string]json.RawMessage, len(req))
+	for rawKey, rawValue := range req {
+		field, ok := normalizeCodexAuthPresetField(rawKey)
+		if !ok {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("unsupported field: %s", rawKey)})
+			return nil, false
+		}
+		if _, exists := normalized[field]; exists {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("duplicate field: %s", field)})
+			return nil, false
+		}
+		if errValidate := validateCodexAuthPresetField(field, rawValue); errValidate != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": errValidate.Error()})
+			return nil, false
+		}
+		normalized[field] = append(json.RawMessage(nil), rawValue...)
+	}
+	return normalized, true
+}
+
+func normalizeCodexAuthPresetField(field string) (string, bool) {
+	switch strings.TrimSpace(field) {
+	case "proxy_url", "proxy-url":
+		return "proxy_url", true
+	case "priority":
+		return "priority", true
+	case "headers":
+		return "headers", true
+	case "excluded_models", "excluded-models":
+		return "excluded_models", true
+	case "rate_limit_max_requests", "request_limit_max_requests":
+		return "rate_limit_max_requests", true
+	case "rate_limit_window_seconds", "request_limit_window_seconds":
+		return "rate_limit_window_seconds", true
+	default:
+		return "", false
+	}
+}
+
+func validateCodexAuthPresetField(field string, raw json.RawMessage) error {
+	value, errDecode := decodeAuthFileFieldValue(raw)
+	if errDecode != nil {
+		return fmt.Errorf("invalid field %s", field)
+	}
+
+	switch field {
+	case "proxy_url":
+		if _, ok := value.(string); !ok {
+			return fmt.Errorf("field proxy_url must be a string")
+		}
+	case "priority":
+		if _, ok := authFileIntValue(value); !ok {
+			return fmt.Errorf("field priority must be an integer")
+		}
+	case "headers":
+		if _, ok := authFileHeadersStringMap(value); !ok {
+			return fmt.Errorf("field headers must be an object with string values")
+		}
+	case "excluded_models":
+		if !authFileStringArray(value) {
+			return fmt.Errorf("field excluded_models must be an array of strings")
+		}
+	case "rate_limit_max_requests", "rate_limit_window_seconds":
+		limit, ok := authFileIntValue(value)
+		if !ok || limit < 0 {
+			return fmt.Errorf("field %s must be a non-negative integer", field)
+		}
+	default:
+		return fmt.Errorf("unsupported field: %s", field)
+	}
+	return nil
 }
 
 func (h *Handler) beginAuthFieldsJob(job *authFieldsJob) bool {
@@ -2163,6 +2258,30 @@ func authFileHeadersStringMap(value any) (map[string]string, bool) {
 	default:
 		return nil, false
 	}
+}
+
+func authFileStringArray(value any) bool {
+	switch typed := value.(type) {
+	case []string:
+		return true
+	case []any:
+		for _, item := range typed {
+			if _, ok := item.(string); !ok {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+func (h *Handler) applyCodexAuthPreset(auth *coreauth.Auth, fields map[string]json.RawMessage) error {
+	if len(fields) == 0 {
+		return nil
+	}
+	_, errPatch := h.applyAuthFileFieldsPatch(auth, fields)
+	return errPatch
 }
 
 func (h *Handler) syncAuthFileMetadataFields(auth *coreauth.Auth, touchedRoots map[string]struct{}) {
@@ -2861,9 +2980,22 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
 }
 
+func (h *Handler) PostCodexToken(c *gin.Context) {
+	preset, ok := h.parseCodexAuthPreset(c)
+	if !ok {
+		return
+	}
+	h.requestCodexToken(c, preset)
+}
+
 func (h *Handler) RequestCodexToken(c *gin.Context) {
+	h.requestCodexToken(c, nil)
+}
+
+func (h *Handler) requestCodexToken(c *gin.Context, preset map[string]json.RawMessage) {
 	ctx := context.Background()
 	ctx = PopulateAuthContext(ctx, c)
+	codexPreset := cloneRawMessageMap(preset)
 
 	fmt.Println("Initializing Codex authentication...")
 
@@ -2988,6 +3120,11 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 				"email":      tokenStorage.Email,
 				"account_id": tokenStorage.AccountID,
 			},
+		}
+		if errPreset := h.applyCodexAuthPreset(record, codexPreset); errPreset != nil {
+			SetOAuthSessionError(state, "Failed to apply Codex auth preset")
+			log.Errorf("Failed to apply Codex auth preset: %v", errPreset)
+			return
 		}
 		savedPath, errSave := h.saveTokenRecord(ctx, record)
 		if errSave != nil {

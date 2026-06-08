@@ -28,6 +28,7 @@ auths/*
 
 # Documentation
 docs/*
+!docs/add-in-api_CN.md
 AGENTS.md
 CLAUDE.md
 GEMINI.md

@@ -1,0 +1,44 @@
+1. 重新用 Podman 构建当前源码镜像：
+
+VERSION="$(git describe --tags --always --dirty)"
+COMMIT="$(git rev-parse --short HEAD)"
+BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+podman build -t localhost/cli-proxy-api:local \
+  --build-arg VERSION="$VERSION" \
+  --build-arg COMMIT="$COMMIT" \
+  --build-arg BUILD_DATE="$BUILD_DATE" \
+.
+
+
+2. 重建 cli-proxy-api容器：
+
+  unset DOCKER_HOST
+  cd /root/CLIProxyAPI   # 换成你的实际 CLIProxyAPI 目录
+
+  podman stop cli-proxy-api
+  podman rm cli-proxy-api
+
+  然后带上 MANAGEMENT_STATIC_PATH 重新启动：
+
+  podman run -d \
+    --name cli-proxy-api \
+    --restart unless-stopped \
+    -e DEPLOY="${DEPLOY:-}" \
+    -e MANAGEMENT_STATIC_PATH=/CLIProxyAPI/static \
+    -p 8317:8317 \
+    -p 8085:8085 \
+    -p 1455:1455 \
+    -p 54545:54545 \
+    -p 51121:51121 \
+    -p 11451:11451 \
+    -v "$(pwd)/config.yaml:/CLIProxyAPI/config.yaml" \
+    -v "$(pwd)/auths:/root/.cli-proxy-api" \
+    -v "$(pwd)/logs:/CLIProxyAPI/logs" \
+    -v "$(pwd)/static:/CLIProxyAPI/static" \
+    localhost/cli-proxy-api:local
+
+  确认：
+
+  podman ps --filter name=cli-proxy-api
+  podman logs -f --tail 100 cli-proxy-api

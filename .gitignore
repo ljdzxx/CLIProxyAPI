@@ -13,6 +13,8 @@ conv/*
 temp/*
 refs/*
 .tmp-webuis/*
+plugins/*
+examples/plugin/bin/*
 
 # Storage backends
 pgstore/*
@@ -41,6 +43,7 @@ GEMINI.md
 .gemini/*
 .serena/*
 .agent/*
+.agents
 .agents/*
 .opencode/*
 .idea/*
